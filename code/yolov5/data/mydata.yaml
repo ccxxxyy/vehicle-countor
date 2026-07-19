@@ -1,0 +1,5 @@
+train: D:/PythonProjects/vehicle-countor/code/yolov5/data/mydata/train.txt
+val: D:/PythonProjects/vehicle-countor/code/yolov5/data/mydata/val.txt
+
+nc: 1
+names: ["car"]

@@ -1,0 +1,34 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Large model weights (keep locally; GitHub hard limit 100MB)
+pt/yolov5l.pt
+pt/yolov5x.pt
+pt/yolov5m.pt
+code/yolov5m.pt
+code/yolov5/yolov5m.pt
+
+# Large / raw videos
+video/9663b86299d95875dcdbe231c1d5caba_raw.mp4
+video/smoke_15s.mp4
+
+# Training / inference outputs
+code/runs/
+code/yolov5/runs/
+code/yolov5/wandb/
+code/inference/
+*.cache
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,2 @@
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\11.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\16.jpg
