@@ -166,10 +166,10 @@ pip install -r requirements.txt
 # Gradio 前端（若 requirements 未包含）
 pip install gradio
 
-# 标注工具（指标二，单独安装）
-pip install labelImg
-# 或使用 labelImg 可执行包 / git clone 安装
+# 标注工具（指标二；Windows + uv 建议钉版本）
+uv pip install labelImg "PyQt5==5.15.11" "PyQt5-Qt5==5.15.2" lxml
 ```
+
 
 ### 4.3 权重说明
 
@@ -288,25 +288,27 @@ on_side = sign(cy - line_y)   # +1 线下, -1 线上
 
 | 步骤 | 内容 |
 |------|------|
-| C1 | 安装并启动 LabelImg |
-| C2 | 设置格式为 PascalVOC，目录指向 `mydata/images`，标注保存到 `mydata/xml` |
-| C3 | 预定义类别：至少 `person`、`car`（可按需加 `truck`） |
-| C4 | 对抽帧图片认真画框并保存 XML |
+| C1 | 安装并启动 LabelImg（`uv pip install labelImg ...`，见 §4.2） |
+| C2 | 格式 PascalVOC；Open Dir → `mydata/images`；Change Save Dir → `mydata/xml` |
+| C3 | 类别文件 `mydata/predefined_classes.txt`：`person`、`car` |
+| C4 | 对抽帧图片认真画框并保存 XML（仓库已抽好 `london_*.jpg`，需人工标注） |
 
-**抽帧建议（可选）**
+**抽帧（已提供脚本；默认每 30 帧一张、宽缩到 1280）**
 
 ```bash
-# 从测试视频每隔 N 帧抽一张图到 mydata/images
-python -c "import cv2,os; p=r'..\video\9663b86299d95875dcdbe231c1d5caba_raw.mp4'; out=r'yolov5\data\mydata\images'; os.makedirs(out,exist_ok=True); cap=cv2.VideoCapture(p); i=n=0
-while True:
- r,f=cap.read()
- if not r: break
- if i%30==0: cv2.imwrite(os.path.join(out,f'{n}.jpg'),f); n+=1
- i+=1
-print('saved',n)"
+# 在仓库根目录
+.venv\Scripts\python.exe code\yolov5\data\mydata\extract_frames.py --every 30 --max-width 1280
 ```
 
-**本阶段完成标志**：指标二打勾。
+**一键启动 LabelImg**
+
+```powershell
+cd code\yolov5\data\mydata
+powershell -ExecutionPolicy Bypass -File .\launch_labelimg.ps1
+# 启动后务必：View → Auto Save on；左侧格式选 PascalVOC；Change Save Dir 指向 xml\
+```
+
+**本阶段完成标志**：指标二打勾（LabelImg 可开 + 至少若干张含 `person`/`car` 的 VOC XML）。
 
 ---
 
@@ -381,20 +383,25 @@ python train.py --img 640 --batch 4 --epochs 3 --data data/mydata.yaml --weights
 
 ### 7.2 指标二：数据标注（LabelImg）
 
-1. 安装：`pip install labelImg` 后执行 `labelImg`
-2. Open Dir → 选择 `code/yolov5/data/mydata/images`
-3. Change Save Dir → 选择 `code/yolov5/data/mydata/xml`
-4. 格式选 **PascalVOC**（生成 `.xml`）
-5. 快捷键：`W` 画框，`Ctrl+S` 保存，`D` 下一张
-6. 类别名使用英文小写，且后续与 `voc2yolo_label.py` 中 `classes` 列表完全一致
+1. 安装（见 §4.2）：`uv pip install labelImg "PyQt5==5.15.11" "PyQt5-Qt5==5.15.2" lxml`
+2. （可选）抽帧：`python code/yolov5/data/mydata/extract_frames.py`
+3. 启动：`powershell -ExecutionPolicy Bypass -File code\yolov5\data\mydata\launch_labelimg.ps1`  
+   或：`.venv\Scripts\labelImg.exe code\yolov5\data\mydata\images code\yolov5\data\mydata\predefined_classes.txt`
+4. **Change Save Dir** → `code/yolov5/data/mydata/xml`
+5. 格式选 **PascalVOC**（生成 `.xml`）
+6. 快捷键：`W` 画框，`Ctrl+S` 保存，`D` 下一张
+7. 类别只用 `person` / `car`（与 `predefined_classes.txt` 一致；阶段 D 里 `voc2yolo_label.py` 的 `classes` 必须同序同名）
 
 **目录约定**
 
 ```text
 mydata/
-  images/xxx.jpg
-  xml/xxx.xml      ← LabelImg 输出
-  labels/xxx.txt   ← 转换脚本输出
+  images/xxx.jpg              ← 待标注 / 已抽帧
+  xml/xxx.xml                 ← LabelImg 输出（PascalVOC）
+  predefined_classes.txt      ← person / car
+  extract_frames.py           ← 从 video/ 抽帧
+  launch_labelimg.ps1         ← 一键启动
+  labels/xxx.txt              ← 阶段 D 转换脚本输出
 ```
 
 ---
