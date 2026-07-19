@@ -10,22 +10,21 @@ __pycache__/
 .vscode/
 *.iml
 
-# Large model weights (keep locally; GitHub hard limit 100MB)
-pt/yolov5l.pt
-pt/yolov5x.pt
-pt/yolov5m.pt
-code/yolov5m.pt
-code/yolov5/yolov5m.pt
+# Large model weights in weights/ (local only; GitHub hard limit 100MB)
+weights/yolov5l.pt
+weights/yolov5x.pt
+weights/yolov5m.pt
 
-# Large / raw videos
+# Official / long test videos (keep locally; too large for GitHub)
+# 注意：video/ 是正式验收素材目录，小体积 smoke_5s_720p.mp4 仍入库
 video/9663b86299d95875dcdbe231c1d5caba_raw.mp4
 video/smoke_15s.mp4
 
-# Training / inference outputs
-code/runs/
+# Runtime outputs (always local; keep outputs/.gitkeep)
+outputs/*
+!outputs/.gitkeep
 code/yolov5/runs/
 code/yolov5/wandb/
-code/inference/
 *.cache
 
 # OS
