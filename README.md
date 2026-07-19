@@ -31,7 +31,7 @@
 
 ### 1.1 定位
 
-- **检测**：YOLOv5（可用 `pt/` 下预训练权重，或自训练权重）
+- **检测**：YOLOv5（可用 `weights/` 下预训练权重，或自训练权重）
 - **追踪**：DeepSort（外观特征 + 卡尔曼滤波 + 匈牙利匹配）
 - **计数**：中部黄线撞线；根据跨线前后中心点 y 判断向上 / 向下；事件文案区分行人 / 车辆
 - **可视化**：对齐参考图——`ID:x` 框、黄线、左上中文面板、最新事件；Gradio 展示 Detection 画面
@@ -103,8 +103,9 @@
 | Gradio 前端 | `code/webui.py` | 上传视频，流式输出原图与 Detection 图 |
 | YOLOv5 | `code/yolov5/` | 训练、验证、检测、导出 |
 | DeepSort | `code/tracker/` | 多目标关联与 ID 维护 |
-| 预训练权重 | `pt/*.pt`、`code/yolov5m.pt` 等 | 直接推理或作微调起点 |
-| 测试视频 | `video/*.mp4` | 离线演示与验收 |
+| 预训练权重 | `weights/*.pt`（唯一目录） | 直接推理或作微调起点 |
+| 测试视频 | `video/*.mp4`（**验收核心素材**） | 详见 `video/README.md` |
+| 运行产物 | `outputs/` | 追踪/训练输出（gitignore） |
 | 标注与转换 | `code/yolov5/data/mydata/` | VOC XML → YOLO TXT、划分数据集 |
 
 ---
@@ -113,42 +114,26 @@
 
 ```text
 vehicle-countor/
-├── README.md                 # 本说明文档
-├── pyproject.toml            # uv / 项目依赖（可选）
-├── pt/                       # 官方预训练权重
-│   ├── yolov5n.pt
-│   ├── yolov5s.pt
-│   ├── yolov5m.pt
-│   ├── yolov5l.pt
-│   └── yolov5x.pt
-├── video/                    # 离线测试视频
-│   └── 9663b86299d95875dcdbe231c1d5caba_raw.mp4
-└── code/                     # 主代码
-    ├── main.py               # 检测+追踪+撞线计数（CLI）
-    ├── webui.py              # Gradio 可视化
-    ├── requirements.txt      # pip 依赖清单
-    ├── int8RT.py             # TensorRT INT8 相关（可选加速）
-    ├── example.mp4           # 示例视频
-    ├── yolov5m.pt / yolov5n.pt
+├── README.md
+├── weights/                  # 权重唯一存放处（勿再放到 code/）
+│   ├── README.md
+│   ├── yolov5n.pt / yolov5s.pt
+│   └── yolov5m.pt / l / x    # 大文件本地保留，默认不推远程
+├── video/                    # ★ 正式测试与验证视频（最重要）
+│   ├── README.md
+│   ├── 9663b86299d95875dcdbe231c1d5caba_raw.mp4   # 官方原始验收视频
+│   ├── smoke_15s.mp4                               # 15s 截取（本地）
+│   └── smoke_5s_720p.mp4                           # 快速冒烟（已入库）
+├── outputs/                  # 运行产物（gitignore，仅保留 .gitkeep）
+│   ├── runs/track/
+│   ├── runs/train/
+│   └── inference/
+└── code/                     # 业务代码
+    ├── VIDEO.md              # 指向 ../video/（已无 example.mp4）
+    ├── main.py / webui.py
+    ├── requirements.txt
     ├── tracker/              # DeepSort
-    │   ├── deep_sort.py
-    │   ├── configs/deep_sort.yaml
-    │   ├── deep/             # ReID 特征与 checkpoint
-    │   └── sort/             # 卡尔曼 / 匹配等
-    └── yolov5/
-        ├── train.py          # 训练
-        ├── detect.py         # 纯检测
-        ├── val.py            # 验证
-        ├── models/           # 网络结构 yaml
-        └── data/
-            ├── mydata.yaml   # 自定义数据集配置（需改成本机路径）
-            └── mydata/       # 标注数据工作区
-                ├── images/   # 图片
-                ├── xml/      # VOC 标注
-                ├── labels/   # YOLO txt 标注
-                ├── dataSet/  # train/val/test 划分列表
-                ├── split_dataset.py
-                └── voc2yolo_label.py
+    └── yolov5/               # 检测框架 + mydata 标注区
 ```
 
 ---
@@ -190,8 +175,7 @@ pip install labelImg
 
 | 权重 | 用途 |
 |------|------|
-| `pt/yolov5*.pt` | COCO 预训练，可直接检测 person/car/truck/bus 等 |
-| `code/yolov5m.pt` 等 | 运行入口默认可引用的本地权重 |
+| `weights/yolov5*.pt` | COCO 预训练，可直接检测 person/car/truck/bus 等（唯一权重目录） |
 | DeepSort ReID | 首次运行会按 `tracker` 逻辑下载到 `tracker/deep/checkpoint/` |
 
 快速验收可用 **COCO 预训练权重 + 类别过滤**（person=0, car=2, truck=7, bus=5），无需先完成自训练。
@@ -255,15 +239,15 @@ pip install labelImg
 | 步骤 | 内容 | 产出 |
 |------|------|------|
 | A1 | 建虚拟环境，安装 `code/requirements.txt` + gradio | 可 import torch / cv2 / yolov5 |
-| A2 | 确认权重路径：优先 `../pt/yolov5m.pt` 或 `code/yolov5m.pt` | 模型可加载 |
-| A3 | 用 CLI 跑测试视频，开启 `--save-vid` | `runs/track/` 下结果 mp4 |
+| A2 | 确认权重路径：`../weights/yolov5n.pt` 等 | 模型可加载 |
+| A3 | 用 CLI 跑 `video/` 测试视频，开启 `--save-vid` | `outputs/runs/track/` 下结果 mp4 |
 | A4 | 用 `yolov5/train.py` 对 `mydata` 做短时训练（1～3 epoch） | 训练不报错，生成 `runs/train/` |
 
 **基线命令（示例）**
 
 ```bash
 cd code
-python main.py --yolo_model ../pt/yolov5m.pt --source ../video/9663b86299d95875dcdbe231c1d5caba_raw.mp4 --save-vid --classes 0 2 5 7 --device 0
+python main.py --yolo_model ../weights/yolov5m.pt --source ../video/9663b86299d95875dcdbe231c1d5caba_raw.mp4 --save-vid --classes 0 2 5 7 --device 0
 ```
 
 > `--classes 0 2 5 7`：COCO 中 person / car / bus / truck。人和车都参与检测与撞线。
@@ -372,7 +356,7 @@ cd d:\PythonProjects\vehicle-countor\code
 
 # 推荐：保存结果视频，过滤人与常见车辆类
 python main.py ^
-  --yolo_model ../pt/yolov5m.pt ^
+  --yolo_model ../weights/yolov5m.pt ^
   --source ../video/9663b86299d95875dcdbe231c1d5caba_raw.mp4 ^
   --save-vid ^
   --classes 0 2 5 7 ^
@@ -380,17 +364,17 @@ python main.py ^
   --device 0
 
 # 仅 CPU
-python main.py --yolo_model ../pt/yolov5n.pt --source ../video/9663b86299d95875dcdbe231c1d5caba_raw.mp4 --save-vid --classes 0 2 5 7 --device cpu
+python main.py --yolo_model ../weights/yolov5n.pt --source ../video/9663b86299d95875dcdbe231c1d5caba_raw.mp4 --save-vid --classes 0 2 5 7 --device cpu
 ```
 
-结果默认在：`code/runs/track/<实验名>/`。
+结果默认在：`outputs/runs/track/<实验名>/`。
 
 **冒烟训练（验证 train.py 可跑）**
 
 ```bash
 cd yolov5
 # 先确保 mydata.yaml 路径已改成本机；可用极小 epoch
-python train.py --img 640 --batch 4 --epochs 3 --data data/mydata.yaml --weights ../../pt/yolov5n.pt --device 0
+python train.py --img 640 --batch 4 --epochs 3 --data data/mydata.yaml --weights ../../weights/yolov5n.pt --device 0
 ```
 
 ---
@@ -463,16 +447,16 @@ names: ["person", "car"]
 
 ```bash
 cd code\yolov5
-python train.py --img 640 --batch 8 --epochs 50 --data data/mydata.yaml --cfg models/yolov5s.yaml --weights ../../pt/yolov5s.pt --name vehicle_person --device 0
+python train.py --img 640 --batch 8 --epochs 50 --data data/mydata.yaml --cfg models/yolov5s.yaml --weights ../../weights/yolov5s.pt --name vehicle_person --device 0
 ```
 
-权重输出示例：`runs/train/vehicle_person/weights/best.pt`。
+权重输出示例：`outputs/runs/train/vehicle_person/weights/best.pt`。
 
 用自训练权重做计数：
 
 ```bash
 cd code
-python main.py --yolo_model yolov5/runs/train/vehicle_person/weights/best.pt --source ../video/9663b86299d95875dcdbe231c1d5caba_raw.mp4 --save-vid --device 0
+python main.py --yolo_model ../outputs/runs/train/vehicle_person/weights/best.pt --source ../video/9663b86299d95875dcdbe231c1d5caba_raw.mp4 --save-vid --device 0
 ```
 
 ---
@@ -502,11 +486,11 @@ python webui.py
 
 | 目的 | 命令 |
 |------|------|
-| 离线计数出视频 | `python main.py --yolo_model ../pt/yolov5m.pt --source ../video/xxx.mp4 --save-vid --classes 0 2 5 7` |
-| 纯检测 | `python yolov5/detect.py --weights ../pt/yolov5m.pt --source ../video/xxx.mp4 --classes 0 2 5 7` |
+| 离线计数出视频 | `python main.py --yolo_model ../weights/yolov5m.pt --source ../video/xxx.mp4 --save-vid --classes 0 2 5 7` |
+| 纯检测 | `python yolov5/detect.py --weights ../weights/yolov5m.pt --source ../video/xxx.mp4 --classes 0 2 5 7` |
 | 划分数据 | `python yolov5/data/mydata/split_dataset.py` |
 | XML→TXT | `python yolov5/data/mydata/voc2yolo_label.py` |
-| 训练 | `python yolov5/train.py --data data/mydata.yaml --weights ../../pt/yolov5s.pt --epochs 50` |
+| 训练 | `python yolov5/train.py --data data/mydata.yaml --weights ../../weights/yolov5s.pt --epochs 50` |
 | 前端 | `python webui.py` |
 | 标注 | `labelImg` |
 
