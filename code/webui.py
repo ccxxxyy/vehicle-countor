@@ -32,15 +32,15 @@ from yolov5.utils.torch_utils import select_device, time_sync
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from tracker.utils.parser import get_config
 from tracker.deep_sort import DeepSort
+from viz_count import LineCrossingCounter, render_frame
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # yolov5 deepsort root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
-count = 0
-count2 = 0
-data = []
+
+COUNTER = LineCrossingCounter(line_ratio=0.5)
 
 
 def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
@@ -50,6 +50,9 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
             opt.save_txt, opt.imgsz, opt.evaluate, opt.half, opt.project, opt.exist_ok, opt.update, opt.save_crop
     webcam = source == '0' or source.startswith(
         'rtsp') or source.startswith('http') or source.endswith('.txt')
+
+    COUNTER.reset()
+    COUNTER.line_ratio = float(getattr(opt, 'line_ratio', 0.5))
 
     # Initialize
     device = select_device(opt.device)  # 设备选择 cpu还是gpu
@@ -196,100 +199,58 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
 
                 # 保存结果
                 if len(outputs[i]) > 0:
-                    for j, (output, conf) in enumerate(zip(outputs[i], confs)):
-
+                    for output in outputs[i]:
                         bboxes = output[0:4]
-                        id = output[4]
+                        tid = output[4]
                         cls = output[5]
-                        count_obj(bboxes, w, h, id)
 
                         if save_txt:
-                            # to MOT format
                             bbox_left = output[0]
                             bbox_top = output[1]
                             bbox_w = output[2] - output[0]
                             bbox_h = output[3] - output[1]
-                            # Write MOT compliant results to file
                             with open(txt_path + '.txt', 'a') as f:
-                                f.write(('%g ' * 10 + '\n') % (frame_idx + 1, id, bbox_left,  # MOT format
+                                f.write(('%g ' * 10 + '\n') % (frame_idx + 1, tid, bbox_left,
                                                                bbox_top, bbox_w, bbox_h, -1, -1, -1, i))
 
-                        if save_vid or save_crop or show_vid:  # Add bbox to image
-                            c = int(cls)  # integer class
-                            label = f'{id} {names[c]} {conf:.2f}'
-                            annotator.box_label(bboxes, label, color=colors(c, True))
-                            if save_crop:
-                                txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
-                                save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[
-                                    c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
+                        if save_crop:
+                            c = int(cls)
+                            crop_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
+                            save_one_box(
+                                bboxes, imc,
+                                file=save_dir / 'crops' / crop_name / names[c] / f'{tid}' / f'{p.stem}.jpg',
+                                BGR=True,
+                            )
 
                 LOGGER.info(f'{s}Done. YOLO:({t3 - t2:.3f}s), DeepSort:({t5 - t4:.3f}s)')
 
             else:
                 deepsort_list[i].increment_ages()
                 LOGGER.info('No detections')
+                outputs[i] = np.empty((0, 6))
 
-            # 可视化
-            im0 = annotator.result()
-            if show_vid:
-                color = (0, 255, 0)
-                start_point = (0, h - 350)  # 横线起始点
-                end_point = (int(w / 2) - 50, h - 350)  # 横线终结点
-                cv2.line(im0, start_point, end_point, color, thickness=2)  # 画线
-                org = (150, 150)
-                font = cv2.FONT_HERSHEY_COMPLEX
-                fontScale = 3
-                thickness = 3
-                cv2.putText(im0, str(count), org, font, fontScale, color, thickness, cv2.LINE_AA)  # 在图片上加字
+            # 黄线撞线 + ID 框 + 左上 OSD
+            tracks = outputs[i] if outputs[i] is not None else np.empty((0, 6))
+            im0 = render_frame(im0, tracks, names, COUNTER, colors)
 
-                color = (255, 0, 0)
-                start_point = (int(w / 2) + 50, h - 350)
-                end_point = (w, h - 350)
-                cv2.line(im0, start_point, end_point, color, thickness=2)
-                org = (w - 150, 150)
-                font = cv2.FONT_HERSHEY_COMPLEX
-                fontScale = 3
-                thickness = 3
-                print('========')
-                cv2.putText(im0, str(count2), org, font, fontScale, color, thickness, cv2.LINE_AA)
-                if grstatus:  # 需要加的
-                    yield cv2.cvtColor(imo, cv2.COLOR_BGR2RGB), cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
+            if grstatus:
+                yield cv2.cvtColor(imo, cv2.COLOR_BGR2RGB), cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
+            elif show_vid:
                 cv2.imshow(str(p), im0)
-                cv2.waitKey(1)  # 1 millisecond
+                cv2.waitKey(1)
 
-            # 保存结果，每张图像带着检测框
             if save_vid:
-                color = (0, 255, 0)
-                start_point = (0, h - 350)
-                end_point = (int(w / 2) - 50, h - 350)
-                cv2.line(im0, start_point, end_point, color, thickness=2)
-                org = (150, 150)
-                font = cv2.FONT_HERSHEY_COMPLEX
-                fontScale = 3
-                thickness = 3
-                cv2.putText(im0, str(count), org, font, fontScale, color, thickness, cv2.LINE_AA)
-
-                color = (255, 0, 0)
-                start_point = (int(w / 2) + 50, h - 350)
-                end_point = (w, h - 350)
-                cv2.line(im0, start_point, end_point, color, thickness=2)
-                org = (w - 150, 150)
-                font = cv2.FONT_HERSHEY_COMPLEX
-                fontScale = 3
-                thickness = 3
-                cv2.putText(im0, str(count2), org, font, fontScale, color, thickness, cv2.LINE_AA)
-                # yield imres,im
                 if vid_path[i] != save_path:  # new video
                     vid_path[i] = save_path
                     if isinstance(vid_writer[i], cv2.VideoWriter):
-                        vid_writer[i].release()  # release previous video writer
-                    if vid_cap:  # video
+                        vid_writer[i].release()
+                    if vid_cap:
                         fps = vid_cap.get(cv2.CAP_PROP_FPS)
                         w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    else:  # stream
+                    else:
                         fps, w, h = 30, im0.shape[1], im0.shape[0]
-                    save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
+                    save_path = str(Path(save_path).with_suffix('.mp4'))
                     vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                 vid_writer[i].write(im0)
 
@@ -304,22 +265,10 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
         strip_optimizer(yolo_model)  # update model (to fix SourceChangeWarning)
 
 
-def count_obj(box, w, h, id):
-    global count, count2, data
-    center_coor = (int(box[0] + (box[2] - box[0]) / 2), int(box[1] + (box[3] - box[1]) / 2))
-    if int(box[1] + (box[3] - box[1]) / 2) > h - 350 and id not in data:
-        if int(box[0] + (box[2] - box[0]) / 2) > int(w / 2):
-            count2 += 1
-        else:
-            count += 1
-        data.append(id)
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--yolo_model', nargs='+', type=str, default='../weights/yolov5n.pt', help='model.pt path(s)')
     parser.add_argument('--deep_sort_model', type=str, default='osnet_ibn_x1_0_MSMT17')
-    # 正式验收请改用 ../video/9663b86299d95875dcdbe231c1d5caba_raw.mp4（见 ../video/README.md）
     parser.add_argument('--source', type=str, default='../video/smoke_5s_720p.mp4', help='source; official test video under ../video/')
     parser.add_argument('--output', type=str, default='../outputs/inference/output', help='output folder')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
@@ -330,8 +279,8 @@ if __name__ == '__main__':
     parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
     parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
     parser.add_argument('--save-txt', action='store_true', help='save MOT compliant results to *.txt')
-    # class 0 is person, 1 is bycicle, 2 is car... 79 is oven
-    parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --class 0, or --class 16 17')
+    parser.add_argument('--classes', nargs='+', type=int, default=[0, 2, 5, 7],
+                        help='filter by class: person/car/bus/truck')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--update', action='store_true', help='update all models')
@@ -345,28 +294,23 @@ if __name__ == '__main__':
     parser.add_argument('--project', default=str((ROOT / '../outputs/runs/track').resolve()), help='save results to project/name')
     parser.add_argument('--name', default='exp', help='save results to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
+    parser.add_argument('--line-ratio', type=float, default=0.5, help='yellow counting line y = h * ratio')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
 
-    origin = False
-    if origin:
+    import gradio as gr
+
+    def mydetect(videoname):
+        opt.source = videoname
         with torch.no_grad():
-            detect(opt)
+            for x in detect(opt, grstatus=True):
+                yield x[0], x[1]
 
-    else:
-        import gradio as gr
-        def mydetect(videoname):
-            opt.source = videoname
-            # vn = cv2.VideoCapture(videoname)
-            # fps = int(vn.get(cv2.CAP_PROP_FPS))
-            # print(fps)
-            with torch.no_grad():
-                for x in detect(opt, grstatus=True):
-                    yield x[0],x[1]
-
-        demo = gr.Interface(
-            fn=mydetect,
-            inputs=gr.Video(sources="upload"),
-            outputs=[gr.Image(), gr.Image()]
-        )
-        demo.queue().launch()
+    demo = gr.Interface(
+        fn=mydetect,
+        inputs=gr.Video(sources="upload"),
+        outputs=[gr.Image(label="origin"), gr.Image(label="Detection")],
+        title="高速车流量 / 客流计数（YOLOv5 + DeepSort）",
+        description="上传视频后输出原图与 Detection（黄线撞线、ID、上下计数、最新事件）。正式验收视频见 ../video/README.md",
+    )
+    demo.queue().launch()
