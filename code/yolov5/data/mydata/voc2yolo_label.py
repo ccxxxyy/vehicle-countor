@@ -4,38 +4,35 @@ import os
 from os import getcwd
 
 sets = ['train', 'val', 'test']
-classes = ["car"]  # 改成自己的类别
+classes = ["person", "car"]  # 与 LabelImg / predefined_classes.txt 一致
 abs_path = os.getcwd()
 print(abs_path)
 
 
 def convert(size, box):
-    dw = 1. / (size[0])
-    dh = 1. / (size[1])
-    x = (box[0] + box[1]) / 2.0 - 1
-    y = (box[2] + box[3]) / 2.0 - 1
+    # box: xmin, xmax, ymin, ymax -> YOLO cx, cy, w, h (normalized)
+    dw = 1.0 / size[0]
+    dh = 1.0 / size[1]
+    x = (box[0] + box[1]) / 2.0
+    y = (box[2] + box[3]) / 2.0
     w = box[1] - box[0]
     h = box[3] - box[2]
-    x = x * dw
-    w = w * dw
-    y = y * dh
-    h = h * dh
-    return x, y, w, h
+    return x * dw, y * dh, w * dw, h * dh
 
 
 def convert_annotation(image_id):
     in_file = open('xml/%s.xml' % (image_id), encoding='UTF-8')
-    out_file = open('labels/%s.txt' % (image_id), 'w')
+    out_file = open('labels/%s.txt' % (image_id), 'w', encoding='UTF-8')
     tree = ET.parse(in_file)
     root = tree.getroot()
     size = root.find('size')
     w = int(size.find('width').text)
     h = int(size.find('height').text)
     for obj in root.iter('object'):
-        # difficult = obj.find('difficult').text
-        difficult = obj.find('difficult').text
+        difficult_node = obj.find('difficult')
+        difficult = 0 if difficult_node is None else int(difficult_node.text)
         cls = obj.find('name').text
-        if cls not in classes or int(difficult) == 1:
+        if cls not in classes or difficult == 1:
             continue
         cls_id = classes.index(cls)
         xmlbox = obj.find('bndbox')
@@ -50,6 +47,8 @@ def convert_annotation(image_id):
         b = (b1, b2, b3, b4)
         bb = convert((w, h), b)
         out_file.write(str(cls_id) + " " + " ".join([str(a) for a in bb]) + '\n')
+    in_file.close()
+    out_file.close()
 
 
 wd = getcwd()

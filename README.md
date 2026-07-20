@@ -212,10 +212,10 @@ uv pip install labelImg "PyQt5==5.15.11" "PyQt5-Qt5==5.15.2" lxml
 
 **验收点**
 
-- [ ] `split_dataset.py` 划分 train/val/test
-- [ ] `voc2yolo_label.py` 将 XML 转为 YOLO TXT（`labels/*.txt`）
-- [ ] `mydata.yaml` 路径、`nc`、`names` 与标注类别一致
-- [ ] `train.py` 能读取数据并开始迭代（至少跑通若干 epoch）
+- [x] `split_dataset.py` 划分 train/val/test
+- [x] `voc2yolo_label.py` 将 XML 转为 YOLO TXT（`labels/*.txt`）
+- [x] `mydata.yaml` 路径、`nc`、`names` 与标注类别一致
+- [x] `train.py` 能读取数据并开始迭代（至少跑通若干 epoch）
 
 ---
 
@@ -316,12 +316,22 @@ powershell -ExecutionPolicy Bypass -File .\launch_labelimg.ps1
 
 | 步骤 | 内容 |
 |------|------|
-| D1 | 修改 `voc2yolo_label.py` 中 `classes = ["person", "car", ...]` 与标注一致 |
-| D2 | 运行 `split_dataset.py` 生成 `dataSet/*.txt` |
-| D3 | 运行 `voc2yolo_label.py` 生成 `labels/*.txt` 与 `train.txt` / `val.txt` |
-| D4 | 修改 `data/mydata.yaml`：**改成本机绝对路径**，更新 `nc` 与 `names` |
-| D5 | 修改 `models/yolov5s.yaml` 或 `custom_yolov5s.yaml` 的 `nc` 与类别数一致 |
-| D6 | 启动训练，检查 loss 下降、权重写出 |
+| D1 | `voc2yolo_label.py`：`classes = ["person", "car"]` |
+| D2 | `split_dataset.py` → `dataSet/*.txt` |
+| D3 | `voc2yolo_label.py` → `labels/*.txt` + `train.txt` / `val.txt` |
+| D4 | `data/mydata.yaml`：本机绝对路径，`nc: 2`，`names: ["person", "car"]` |
+| D5 | `models/yolov5n.yaml` / `custom_yolov5s.yaml`：`nc: 2` |
+| D6 | 训练写出 `best.pt` / `last.pt` |
+
+```powershell
+cd code\yolov5\data\mydata
+..\..\..\..\.venv\Scripts\python.exe split_dataset.py
+..\..\..\..\.venv\Scripts\python.exe voc2yolo_label.py
+cd ..\..
+..\..\.venv\Scripts\python.exe train.py --img 640 --batch 2 --epochs 5 --data data/mydata.yaml --weights ../../weights/yolov5n.pt --cfg models/yolov5n.yaml --device cpu --project ../../outputs/runs/train --name phase_d --exist-ok
+```
+
+权重输出：`outputs/runs/train/phase_d/weights/best.pt`（及 `last.pt`）。
 
 **本阶段完成标志**：指标三打勾；得到 `best.pt` / `last.pt`。
 
