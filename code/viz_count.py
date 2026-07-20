@@ -75,6 +75,8 @@ class LineCrossingCounter:
         self._prev_cy: Dict[int, float] = {}
         self._track_cls: Dict[int, str] = {}
         self._counted_cross: set = set()  # (track_id, direction) 防重复
+        self._last_person_now = 0
+        self._last_vehicle_now = 0
 
     def line_y(self, h: int) -> int:
         return int(h * self.line_ratio)
@@ -159,15 +161,46 @@ class LineCrossingCounter:
         self.latest = f"最新：{cn} {tid} 号{dir_cn}穿过黄线"
         return direction
 
+    def summary_text(self, person_now: int | None = None, vehicle_now: int | None = None) -> str:
+        """供 CLI / Gradio 显示的计数摘要。"""
+        lines = []
+        if person_now is not None and vehicle_now is not None:
+            lines.append(f"当前画面：行人 {person_now} / 车辆 {vehicle_now}")
+        lines.append(f"累计出现：行人 {self.person_total} / 车辆 {self.vehicle_total}")
+        return "\n".join(lines)
 
-def draw_id_box(im, bbox_xyxy, track_id: int, color: Tuple[int, int, int], thickness: int = 2) -> None:
+
+def draw_id_box(
+    im,
+    bbox_xyxy,
+    track_id: int,
+    color: Tuple[int, int, int],
+    thickness: int = 2,
+    label_extra: str = "",
+) -> None:
     x1, y1, x2, y2 = map(int, bbox_xyxy[:4])
-    cv2.rectangle(im, (x1, y1), (x2, y2), color, thickness)
+    # ID 文字故意放大：预览缩到 960 宽后仍要一眼能看清
+    h = im.shape[0]
+    font_scale = max(1.35, h / 720.0 * 1.6)
+    thick = max(3, int(round(h / 720.0 * 4)))
+    cv2.rectangle(im, (x1, y1), (x2, y2), color, thick)
     label = f"ID:{int(track_id)}"
-    (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-    ty = max(0, y1 - th - 4)
-    cv2.rectangle(im, (x1, ty), (x1 + tw + 4, y1), color, -1)
-    cv2.putText(im, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    if label_extra:
+        label = f"{label} {label_extra}"
+    (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thick)
+    pad = 10
+    ty = max(0, y1 - th - pad)
+    cv2.rectangle(im, (x1, ty), (x1 + tw + pad * 2, y1), color, -1)
+    cv2.putText(
+        im,
+        label,
+        (x1 + pad, y1 - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (255, 255, 255),
+        thick,
+        cv2.LINE_AA,
+    )
 
 
 def draw_yellow_line(im, line_y: int, thickness: int = 2) -> None:
@@ -175,31 +208,22 @@ def draw_yellow_line(im, line_y: int, thickness: int = 2) -> None:
     cv2.line(im, (0, int(line_y)), (w - 1, int(line_y)), (0, 255, 255), thickness, cv2.LINE_AA)
 
 
-def draw_osd_panel(im, counter: LineCrossingCounter) -> np.ndarray:
-    """左上半透明中文面板（含行人/车辆分别累计）。"""
+def draw_osd_panel(im, person_now: int, vehicle_now: int) -> np.ndarray:
+    """左上半透明中文面板：当前画面行人 / 车辆数量。"""
     lines = [
-        f"客流总数：{counter.total}",
-        f"行人：{counter.person_total}  车辆：{counter.vehicle_total}",
-        "穿过黄线：",
-        f"行人 向上：{counter.person_up}  向下：{counter.person_down}",
-        f"车辆 向上：{counter.vehicle_up}  向下：{counter.vehicle_down}",
-        f"合计 向上：{counter.up}  向下：{counter.down}",
+        f"行人：{person_now}",
+        f"车辆：{vehicle_now}",
     ]
-    if counter.latest:
-        lines.append(counter.latest)
 
-    font = _load_font(22)
-    font_small = _load_font(20)
-    # 估面板尺寸
-    pad_x, pad_y, line_h = 12, 10, 28
+    font = _load_font(max(32, int(im.shape[0] / 720 * 36)))
+    pad_x, pad_y, line_h = 16, 14, 40
     max_w = 0
     for text in lines:
-        fnt = font_small if text.startswith("最新") else font
         try:
-            bbox = fnt.getbbox(text)
+            bbox = font.getbbox(text)
             tw = bbox[2] - bbox[0]
         except Exception:
-            tw, _ = fnt.getsize(text)
+            tw, _ = font.getsize(text)
         max_w = max(max_w, tw)
     panel_w = max_w + pad_x * 2
     panel_h = pad_y * 2 + line_h * len(lines)
@@ -213,10 +237,7 @@ def draw_osd_panel(im, counter: LineCrossingCounter) -> np.ndarray:
     draw = ImageDraw.Draw(pil)
     y = 8 + pad_y
     for text in lines:
-        if text.startswith("最新"):
-            draw.text((8 + pad_x, y), text, font=font_small, fill=(255, 64, 64))
-        else:
-            draw.text((8 + pad_x, y), text, font=font, fill=(255, 255, 255))
+        draw.text((8 + pad_x, y), text, font=font, fill=(255, 255, 255))
         y += line_h
     return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
@@ -227,26 +248,39 @@ def render_frame(
     names,
     counter: LineCrossingCounter,
     colors_fn,
+    draw_line: bool = False,
 ) -> np.ndarray:
     """
     tracks: iterable of [x1,y1,x2,y2,track_id,cls_id]
+    画面叠加 ID 框；左上显示【当前帧】行人/车辆数量（不是乱跳的累计 ID）。
     """
     im = im0.copy()
     h = im.shape[0]
-    ly = counter.line_y(h)
+    person_now = 0
+    vehicle_now = 0
 
     for t in tracks:
         x1, y1, x2, y2, tid, cls_id = t[:6]
         c = int(cls_id)
-        name = names[c] if isinstance(names, (list, dict)) or hasattr(names, "__getitem__") else str(c)
         try:
             name = names[c]
         except Exception:
             name = str(c)
+        # 累计仍记录（摘要用）；画面数字用当前帧
         counter.update(int(tid), (x1, y1, x2, y2), h, name)
+        kind = counter._kind(name)
+        if kind == "person":
+            person_now += 1
+        elif kind == "vehicle":
+            vehicle_now += 1
         color = colors_fn(int(tid), True)
-        draw_id_box(im, (x1, y1, x2, y2), int(tid), color)
+        extra = class_cn(name)
+        draw_id_box(im, (x1, y1, x2, y2), int(tid), color, label_extra=extra)
 
-    draw_yellow_line(im, ly, thickness=2)
-    im = draw_osd_panel(im, counter)
+    if draw_line:
+        draw_yellow_line(im, counter.line_y(h), thickness=2)
+    im = draw_osd_panel(im, person_now, vehicle_now)
+    # 挂到 counter 上供 Gradio 摘要读取
+    counter._last_person_now = person_now
+    counter._last_vehicle_now = vehicle_now
     return im

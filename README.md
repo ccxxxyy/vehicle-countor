@@ -223,10 +223,10 @@ uv pip install labelImg "PyQt5==5.15.11" "PyQt5-Qt5==5.15.2" lxml
 
 **验收点**
 
-- [ ] `webui.py` 启动后浏览器可打开界面
-- [ ] 可上传测试视频
-- [ ] 输出原视频帧与 Detection 帧（框、ID、计数信息）
-- [ ] Detection 画面含黄线、左上统计面板、上下方向计数、最新事件提示
+- [x] `webui.py` 启动后浏览器可打开界面
+- [x] 可上传测试视频
+- [x] 输出原视频帧与 Detection 帧（框、ID、计数信息）
+- [x] Detection 画面含黄线、左上统计面板、上下方向计数、最新事件提示
 
 ---
 
@@ -341,11 +341,17 @@ cd ..\..
 
 | 步骤 | 内容 |
 |------|------|
-| E1 | 整理 `webui.py`：上传视频 → 调用改造后的 `detect` → 流式输出 origin / Detection |
-| E2 | 界面文案：标题、说明、计数摘要（可用额外 Text组件显示最终人数/车数） |
-| E3 | 默认权重、`--classes`、设备（cpu/cuda）可配置 |
-| E4 | 关闭无头环境下的 `cv2.imshow`，避免服务器/无显示器报错 |
-| E5 | 用 `video/` 测试视频完整跑通并录屏/截图验收 |
+| E1 | `webui.py`：上传视频 → `detect(..., grstatus=True)` → 流式 origin / Detection / 摘要 |
+| E2 | 标题、说明、计数摘要 Text（行人/车辆/上下） |
+| E3 | 权重下拉、类别 ID、设备 cpu/0、黄线位置、置信度可配 |
+| E4 | Gradio 路径禁用 `cv2.imshow` |
+| E5 | smoke 视频流式检测已冒烟通过 |
+
+```powershell
+cd code
+..\.venv\Scripts\python.exe webui.py
+# 浏览器打开终端提示的地址（默认 http://127.0.0.1:7860，占用时自动换端口）
+```
 
 **本阶段完成标志**：四项指标全部满足。
 

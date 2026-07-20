@@ -231,9 +231,13 @@ def detect(opt):  # gradio可视化时需要加一个参数
             tracks = outputs[i] if outputs[i] is not None else np.empty((0, 6))
             im0 = render_frame(im0, tracks, names, COUNTER, colors)
 
+            # 无头/无显示器环境禁止 imshow（E4）
             if show_vid:
-                cv2.imshow(str(p), im0)
-                cv2.waitKey(1)  # 1 millisecond
+                try:
+                    cv2.imshow(str(p), im0)
+                    cv2.waitKey(1)  # 1 millisecond
+                except cv2.error:
+                    show_vid = False
 
             # 保存结果，每张图像带着检测框
             if save_vid:

@@ -12,7 +12,6 @@ import sys
 sys.path.insert(0, './yolov5')
 
 import argparse
-import os
 import platform
 import shutil
 import time
@@ -25,7 +24,7 @@ import torch.backends.cudnn as cudnn
 from yolov5.models.experimental import attempt_load
 from yolov5.utils.downloads import attempt_download
 from yolov5.models.common import DetectMultiBackend
-from yolov5.utils.datasets import LoadImages, LoadStreams, VID_FORMATS
+from yolov5.utils.datasets import LoadImages, LoadStreams, VID_FORMATS, letterbox
 from yolov5.utils.general import (LOGGER, check_img_size, non_max_suppression, scale_coords,
                                   check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr)
 from yolov5.utils.torch_utils import select_device, time_sync
@@ -42,14 +41,266 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 COUNTER = LineCrossingCounter(line_ratio=0.5)
 
+# 全局缓存：避免每次点「开始」都重新加载 YOLO（很慢）
+_YOLO_CACHE = {}
+
+
+def _iou_xyxy(a, b) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+class SimpleIoUTracker:
+    """无 ReID 的轻量追踪（比 DeepSort 快一个数量级，适合 CPU / Gradio）。"""
+
+    def __init__(self, iou_thresh: float = 0.2, max_age: int = 40, dist_thresh: float = 0.15):
+        self.iou_thresh = iou_thresh
+        self.max_age = max_age
+        self.dist_thresh = dist_thresh  # 中心点距离相对画面对角线
+        self.next_id = 1
+        self.tracks = {}
+
+    @staticmethod
+    def _center(box):
+        x1, y1, x2, y2 = box
+        return (x1 + x2) * 0.5, (y1 + y2) * 0.5
+
+    def update(self, boxes_xyxy, class_ids, frame_wh=None) -> np.ndarray:
+        boxes = [list(map(float, b[:4])) for b in boxes_xyxy]
+        clss = [int(c) for c in class_ids]
+        diag = 1.0
+        if frame_wh is not None:
+            diag = float((frame_wh[0] ** 2 + frame_wh[1] ** 2) ** 0.5) or 1.0
+
+        for tid in list(self.tracks.keys()):
+            self.tracks[tid]["age"] += 1
+
+        matched_det = set()
+        matched_tid = set()
+        pairs = []
+        for di, box in enumerate(boxes):
+            cx, cy = self._center(box)
+            for tid, tr in self.tracks.items():
+                if tr["cls"] != clss[di]:
+                    continue
+                iou = _iou_xyxy(box, tr["box"])
+                tx, ty = self._center(tr["box"])
+                dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5 / diag
+                # IoU 优先；隔帧时 IoU 可能变小，用中心距离兜底
+                score = iou if iou >= self.iou_thresh else (1.0 - dist if dist <= self.dist_thresh else -1.0)
+                if score >= 0:
+                    pairs.append((score, di, tid))
+        pairs.sort(reverse=True)
+        for score, di, tid in pairs:
+            if di in matched_det or tid in matched_tid:
+                continue
+            self.tracks[tid] = {"box": boxes[di], "cls": clss[di], "age": 0}
+            matched_det.add(di)
+            matched_tid.add(tid)
+
+        for di, box in enumerate(boxes):
+            if di in matched_det:
+                continue
+            tid = self.next_id
+            self.next_id += 1
+            self.tracks[tid] = {"box": box, "cls": clss[di], "age": 0}
+
+        for tid in [t for t, tr in self.tracks.items() if tr["age"] > self.max_age]:
+            del self.tracks[tid]
+
+        outs = []
+        for tid, tr in self.tracks.items():
+            if tr["age"] > 0:
+                continue
+            x1, y1, x2, y2 = tr["box"]
+            outs.append([x1, y1, x2, y2, tid, tr["cls"]])
+        return np.asarray(outs, dtype=np.float32) if outs else np.empty((0, 6), dtype=np.float32)
+
+
+def _to_gradio_file(path: str | None) -> str | None:
+    """把结果视频拷到系统临时目录，避免 Gradio cache 权限错误。"""
+    if not path:
+        return None
+    src = Path(path)
+    if not src.is_file():
+        return None
+    import tempfile
+    import shutil as _shutil
+
+    dst = Path(tempfile.gettempdir()) / f"vc_{src.name}"
+    _shutil.copy2(src, dst)
+    return str(dst)
+
+
+def _get_cached_yolo(weight, device, dnn=False):
+    key = (str(weight), str(device), bool(dnn))
+    if key not in _YOLO_CACHE:
+        model = DetectMultiBackend(weight, device=device, dnn=dnn)
+        stride, names, pt = model.stride, model.names, model.pt
+        model.warmup(imgsz=(1, 3, 320, 320))
+        _YOLO_CACHE[key] = (model, stride, names, pt)
+        LOGGER.info(f"YOLO cached: {key[0]}")
+    return _YOLO_CACHE[key]
+
+
+def detect_fast(opt):
+    """Gradio 快速路径：跳过 DeepSort ReID + 跳帧解码 + 小分辨率 + 模型缓存。"""
+    source = opt.source
+    weight = opt.yolo_model[0] if isinstance(opt.yolo_model, (list, tuple)) else opt.yolo_model
+    device = select_device(opt.device)
+    torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+
+    frame_stride = max(1, int(getattr(opt, "frame_stride", 8)))
+    max_frames = int(getattr(opt, "max_frames", 40))
+    imgsz = int(getattr(opt, "imgsz", [320])[0] if isinstance(opt.imgsz, list) else getattr(opt, "imgsz", 320))
+    imgsz = check_img_size(imgsz, s=32)
+
+    yield None, (
+        f"快速模式：跳过 DeepSort。\n"
+        f"隔帧={frame_stride}，最多={max_frames or '不限'}，输入={imgsz}，设备={device}\n"
+        f"正在加载/复用模型…"
+    ), None
+
+    model, stride, names, pt = _get_cached_yolo(weight, device, getattr(opt, "dnn", False))
+    if isinstance(names, dict):
+        # ok
+        pass
+
+    COUNTER.reset()
+    # 隔帧较大时放宽关联，减少同一目标反复换 ID → 累计人数爆炸
+    tracker = SimpleIoUTracker(iou_thresh=0.15, max_age=max(40, frame_stride * 4), dist_thresh=0.2)
+
+    # 始终写到仓库 outputs/，不要用权重绝对路径当目录名
+    repo_root = Path(__file__).resolve().parents[1]
+    save_dir = repo_root / "outputs" / "runs" / "track" / "gradio_fast"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    out_path = str(save_dir / f"{Path(source).stem}_fast.mp4")
+
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        yield None, f"无法打开视频：{source}", None
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    # 预览/写盘缩小宽度，4K 全分辨率写盘极慢
+    out_w = min(960, w0 if w0 > 0 else 960)
+    scale = out_w / w0 if w0 > 0 else 1.0
+    out_h = int((h0 if h0 > 0 else 540) * scale)
+    # 播放更慢更长：固定约 6fps，每帧停留更久（不要用原视频 fps/stride，否则只有几秒）
+    playback_fps = float(getattr(opt, "playback_fps", 6.0))
+    writer = cv2.VideoWriter(
+        out_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        max(1.0, playback_fps),
+        (out_w, out_h),
+    )
+
+    processed = 0
+    frame_idx = -1
+    last_rgb = None
+    t_all0 = time.time()
+
+    while True:
+        # 跳帧：grab 丢弃，不 decode，比逐帧读再 continue 快很多
+        for _ in range(frame_stride - 1):
+            if not cap.grab():
+                break
+            frame_idx += 1
+        ok, im0 = cap.read()
+        if not ok:
+            break
+        frame_idx += 1
+
+        if max_frames > 0 and processed >= max_frames:
+            break
+        processed += 1
+
+        # 推理用缩小图
+        im_rs = cv2.resize(im0, (out_w, out_h), interpolation=cv2.INTER_AREA) if scale < 0.999 else im0
+        img, _, _ = letterbox(im_rs, imgsz, stride=stride, auto=pt)
+        img = img[:, :, ::-1].transpose(2, 0, 1)
+        img = np.ascontiguousarray(img)
+        im = torch.from_numpy(img).to(device)
+        im = im.float() / 255.0
+        if im.ndimension() == 3:
+            im = im.unsqueeze(0)
+
+        pred = model(im, augment=False, visualize=False)
+        pred = non_max_suppression(
+            pred, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms, max_det=opt.max_det
+        )
+
+        det = pred[0]
+        tracks = np.empty((0, 6), dtype=np.float32)
+        if det is not None and len(det):
+            det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im_rs.shape).round()
+            boxes = det[:, :4].detach().cpu().numpy()
+            clss = det[:, 5].detach().cpu().numpy()
+            tracks = tracker.update(boxes, clss, frame_wh=(out_w, out_h))
+
+        rendered = render_frame(im_rs, tracks, names, COUNTER, colors, draw_line=False)
+        writer.write(rendered)
+        last_rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
+
+        elapsed = time.time() - t_all0
+        fps_eff = processed / elapsed if elapsed > 0 else 0
+        summary = (
+            f"快速模式运行中\n"
+            f"已处理 {processed}"
+            + (f"/{max_frames}" if max_frames > 0 else "")
+            + f" 帧 | 源进度 #{frame_idx}"
+            + (f"/{total}" if total else "")
+            + f" | 约 {fps_eff:.2f} 处理帧/秒\n"
+            + COUNTER.summary_text(COUNTER._last_person_now, COUNTER._last_vehicle_now)
+            + "\n（画面左上数字=当前帧人数/车数）"
+        )
+        yield last_rgb, summary, None
+
+    cap.release()
+    writer.release()
+    elapsed = time.time() - t_all0
+    done = (
+        f"完成（快速模式）。耗时 {elapsed:.1f}s，处理 {processed} 帧。\n"
+        f"{COUNTER.summary_text(COUNTER._last_person_now, COUNTER._last_vehicle_now)}\n\n"
+        f"视频已保存：{out_path}"
+    )
+    yield last_rgb, done, _to_gradio_file(out_path)
+
 
 def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
     out, source, yolo_model, deep_sort_model, show_vid, save_vid, save_txt, imgsz, evaluate, half, \
         project, exist_ok, update, save_crop = \
         opt.output, opt.source, opt.yolo_model, opt.deep_sort_model, opt.show_vid, opt.save_vid, \
-            opt.save_txt, opt.imgsz, opt.evaluate, opt.half, opt.project, opt.exist_ok, opt.update, opt.save_crop
+            opt.save_txt, opt.imgsz, opt.evaluate, opt.half, \
+            opt.project, opt.exist_ok, opt.update, opt.save_crop
     webcam = source == '0' or source.startswith(
         'rtsp') or source.startswith('http') or source.endswith('.txt')
+
+    # Gradio / 无头：绝不弹窗；并强制写出处理后视频
+    preview_every = int(getattr(opt, 'preview_every', 5))
+    frame_stride = max(1, int(getattr(opt, 'frame_stride', 1)))
+    max_frames = int(getattr(opt, 'max_frames', 0))  # 0=不限制
+    last_saved_video = None
+    last_det_rgb = None
+    processed = 0
+    if grstatus:
+        show_vid = False
+        save_vid = True
+        # 先立刻回传状态，避免界面一直转圈
+        yield None, "正在加载模型与视频，请稍候…", None
 
     COUNTER.reset()
     COUNTER.line_ratio = float(getattr(opt, 'line_ratio', 0.5))
@@ -66,15 +317,17 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
             shutil.rmtree(out)  # 删掉输出文件夹
         os.makedirs(out)  # # 新建输出文件夹
 
-    # Directories
-    if type(yolo_model) is str:  # 单个yolo模型
-        exp_name = yolo_model.split(".")[0]  # 导出目录yolo名称，下同
-    elif type(yolo_model) is list and len(yolo_model) == 1:  # 单个yolo模型，以list方式送入
-        exp_name = yolo_model[0].split(".")[0]
-    else:  # 多个yolo模型，在写论文时可以快速出对比结果
+    # Directories（必须用 stem，不能用绝对路径字符串，否则会写到 weights/ 下）
+    if type(yolo_model) is str:
+        exp_name = Path(yolo_model).stem
+    elif type(yolo_model) is list and len(yolo_model) == 1:
+        exp_name = Path(yolo_model[0]).stem
+    else:
         exp_name = "ensemble"
-    exp_name = exp_name + "_" + deep_sort_model.split('/')[-1].split('.')[0]  # 导出目录yolo+deepsort名称，
-    save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # 组装路径
+    exp_name = exp_name + "_" + Path(deep_sort_model).stem
+    # project 固定到仓库 outputs，避免相对路径跑飞
+    project_dir = Path(__file__).resolve().parents[1] / "outputs" / "runs" / "track"
+    save_dir = increment_path(project_dir / exp_name, exist_ok=exist_ok)
     (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # 根据组装的路径创建文件夹
 
     # 加载yolo模型
@@ -95,7 +348,7 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
 
     # 数据加载器
     if webcam:  # 如果输入是摄像头，也就是source 为0
-        show_vid = check_imshow()
+        show_vid = check_imshow() if not grstatus else False
         cudnn.benchmark = True  # 使用cudnn去批量加速图片推理
         dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt)  # 因为是摄像头，所以走加载视频流的方式
         nr_sources = len(dataset)  # 获取数据集的长度
@@ -129,6 +382,13 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
     model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # 预热阶段，模型加载起来都要先预热，相当于快速推理，将模型加载到内存里，以便后续使用
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
     for frame_idx, (path, im, im0s, vid_cap, s) in enumerate(dataset):  # 开始循环遍历数据集中的数据
+        # Gradio 加速：隔帧处理，并可限制最多处理帧数（否则 CPU 上像一直加载）
+        if frame_idx % frame_stride != 0:
+            continue
+        if max_frames > 0 and processed >= max_frames:
+            break
+        processed += 1
+
         t1 = time_sync()
         im = torch.from_numpy(im).to(device)  # 将数据加载到GPU或者CPU上
         im = im.half() if half else im.float()  # uint8 to fp16/32  半精度的数据类型转换
@@ -233,11 +493,23 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
             tracks = outputs[i] if outputs[i] is not None else np.empty((0, 6))
             im0 = render_frame(im0, tracks, names, COUNTER, colors)
 
+            # Gradio：预览 Detection + 进度（每帧都更新摘要）
             if grstatus:
-                yield cv2.cvtColor(imo, cv2.COLOR_BGR2RGB), cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
+                last_det_rgb = cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
+                progress = (
+                    f"处理中：第 {processed} 帧"
+                    + (f" / 最多 {max_frames}" if max_frames > 0 else "")
+                    + f"（源帧 #{frame_idx}，步长 {frame_stride}）\n"
+                    + COUNTER.summary_text()
+                )
+                if processed == 1 or processed % max(1, preview_every) == 0:
+                    yield last_det_rgb, progress, None
             elif show_vid:
-                cv2.imshow(str(p), im0)
-                cv2.waitKey(1)
+                try:
+                    cv2.imshow(str(p), im0)
+                    cv2.waitKey(1)
+                except cv2.error:
+                    show_vid = False
 
             if save_vid:
                 if vid_path[i] != save_path:  # new video
@@ -251,8 +523,13 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
                     else:
                         fps, w, h = 30, im0.shape[1], im0.shape[0]
                     save_path = str(Path(save_path).with_suffix('.mp4'))
+                    last_saved_video = save_path
                     vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                 vid_writer[i].write(im0)
+
+    for vw in vid_writer:
+        if isinstance(vw, cv2.VideoWriter):
+            vw.release()
 
     # Print results
     t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
@@ -261,11 +538,23 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
     if save_txt or save_vid:
         s = f"\n{len(list(save_dir.glob('tracks/*.txt')))} tracks saved to {save_dir / 'tracks'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
+        if last_saved_video:
+            LOGGER.info(f'Processed video: {last_saved_video}')
     if update:
         strip_optimizer(yolo_model)  # update model (to fix SourceChangeWarning)
 
+    if grstatus:
+        yield (
+            last_det_rgb,
+            COUNTER.summary_text(
+                getattr(COUNTER, "_last_person_now", None),
+                getattr(COUNTER, "_last_vehicle_now", None),
+            ),
+            _to_gradio_file(last_saved_video),
+        )
 
-if __name__ == '__main__':
+
+def _build_default_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--yolo_model', nargs='+', type=str, default='../weights/yolov5n.pt', help='model.pt path(s)')
     parser.add_argument('--deep_sort_model', type=str, default='osnet_ibn_x1_0_MSMT17')
@@ -275,7 +564,7 @@ if __name__ == '__main__':
     parser.add_argument('--conf-thres', type=float, default=0.5, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--device', default='cpu', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
     parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
     parser.add_argument('--save-txt', action='store_true', help='save MOT compliant results to *.txt')
@@ -295,22 +584,194 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='exp', help='save results to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--line-ratio', type=float, default=0.5, help='yellow counting line y = h * ratio')
-    opt = parser.parse_args()
+    opt = parser.parse_args([])
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
+    return opt
 
+
+def _as_video_path(video) -> str:
+    """兼容 Gradio Video / File 返回值。"""
+    if video is None:
+        raise ValueError("请先上传视频文件")
+    # gradio FileData / dict
+    if isinstance(video, dict):
+        path = video.get("path") or video.get("name") or video.get("video")
+        if not path:
+            raise ValueError("无法解析上传视频路径")
+        return str(path)
+    # 有的版本返回带 .path 属性的对象
+    path = getattr(video, "path", None) or getattr(video, "name", None)
+    if path:
+        return str(path)
+    return str(video)
+
+
+def _parse_classes(text: str):
+    text = (text or "").strip()
+    if not text:
+        return [0, 2, 5, 7]
+    parts = [p for p in text.replace(",", " ").split() if p]
+    return [int(p) for p in parts]
+
+
+def _weight_choices() -> list[tuple[str, str]]:
+    """返回 [(显示名, 绝对路径), ...]，便于下拉里认出 london2。"""
+    repo = Path(__file__).resolve().parents[1]
+    candidates = [
+        ("phase_d_london2（自训练 人/车，推荐）", repo / "outputs" / "runs" / "train" / "phase_d_london2" / "weights" / "best.pt"),
+        ("phase_d_london（自训练 人/车）", repo / "outputs" / "runs" / "train" / "phase_d_london" / "weights" / "best.pt"),
+        ("phase_d（自训练 人/车）", repo / "outputs" / "runs" / "train" / "phase_d" / "weights" / "best.pt"),
+        ("yolov5n（COCO 预训练，80类）", repo / "weights" / "yolov5n.pt"),
+        ("yolov5s（COCO 预训练，80类）", repo / "weights" / "yolov5s.pt"),
+    ]
+    found = [(label, str(p.resolve())) for label, p in candidates if p.exists()]
+    if not found:
+        p = (repo / "weights" / "yolov5n.pt").resolve()
+        found = [("yolov5n（COCO）", str(p))]
+    return found
+
+
+def _resolve_weight(weight) -> str:
+    """下拉可能是显示名、路径，或 Gradio (label, value)。"""
+    if isinstance(weight, (list, tuple)) and len(weight) >= 2:
+        return str(weight[1])
+    s = str(weight or "").strip()
+    for label, path in _weight_choices():
+        if s == label or s == path or Path(s).name == Path(path).name and "phase_d" in path:
+            if s == label or s == path:
+                return path
+    # 显示名模糊匹配
+    for label, path in _weight_choices():
+        if s in label or label in s:
+            return path
+    return s
+
+
+def build_demo(opt):
     import gradio as gr
 
-    def mydetect(videoname):
-        opt.source = videoname
-        with torch.no_grad():
-            for x in detect(opt, grstatus=True):
-                yield x[0], x[1]
+    weight_list = _weight_choices()  # [(label, path), ...]
+    default_label, default_path = weight_list[0]
+    # Gradio Dropdown：用 label 作 choices，内部再映射到路径
+    weight_labels = [lab for lab, _ in weight_list]
+    label_to_path = {lab: path for lab, path in weight_list}
 
-    demo = gr.Interface(
-        fn=mydetect,
-        inputs=gr.Video(sources="upload"),
-        outputs=[gr.Image(label="origin"), gr.Image(label="Detection")],
-        title="高速车流量 / 客流计数（YOLOv5 + DeepSort）",
-        description="上传视频后输出原图与 Detection（黄线撞线、ID、上下计数、最新事件）。正式验收视频见 ../video/README.md",
+    def run_detect(
+        video, weight, device, classes_text, conf_thres, frame_stride, max_frames, playback_fps, use_deepsort
+    ):
+        if video is None:
+            yield None, "请先上传视频文件，再点「开始检测计数」", None
+            return
+        weight_path = label_to_path.get(str(weight), _resolve_weight(weight))
+        opt.source = _as_video_path(video)
+        opt.yolo_model = [weight_path]
+        opt.device = device or "cpu"
+        opt.classes = _parse_classes(classes_text)
+        opt.conf_thres = float(conf_thres)
+        opt.show_vid = False
+        opt.save_vid = True
+        opt.exist_ok = True
+        opt.preview_every = 1
+        opt.frame_stride = int(frame_stride)
+        opt.max_frames = int(max_frames)
+        opt.playback_fps = float(playback_fps)
+        # 快速模式默认 416：比 320 准一点，仍比 640 快
+        opt.imgsz = [416, 416]
+
+        # 自训练 2 类模型：只保留 人=0 / 车=1（忽略误填的 COCO 编号）
+        wlow = weight_path.replace("\\", "/").lower()
+        if "phase_d" in wlow:
+            opt.classes = [0, 1]
+
+        out_video = None
+        preview = None
+        summary = ""
+        try:
+            with torch.no_grad():
+                if use_deepsort:
+                    gen = detect(opt, grstatus=True)
+                else:
+                    gen = detect_fast(opt)
+                for preview, summary, video_path in gen:
+                    if video_path:
+                        out_video = video_path
+                    yield preview, summary, out_video
+            if out_video:
+                yield preview, (summary or "") + f"\n\n完成。视频：{out_video}", out_video
+        except Exception as e:
+            import traceback
+            yield None, f"出错：{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}", None
+
+    tips = (
+        "**推荐**：权重选 **phase_d_london2（自训练 人/车）**，类别填 **`0,1`**（0=人，1=车）。\n\n"
+        "**慢速预览**：默认隔 2 帧、最多 150 帧、播放约 4fps → 输出约 37 秒。"
     )
-    demo.queue().launch()
+
+    with gr.Blocks(title="客流 / 车流计数") as demo:
+        gr.Markdown("# 客流 / 车流计数（YOLOv5）")
+        gr.Markdown(tips)
+        with gr.Row():
+            with gr.Column(scale=1):
+                video_in = gr.File(
+                    label="上传原视频（mp4/avi/mov/mkv）",
+                    file_types=[".mp4", ".avi", ".mov", ".mkv", ".webm"],
+                    type="filepath",
+                )
+                weight = gr.Dropdown(
+                    choices=weight_labels,
+                    value=default_label,
+                    label="YOLO 权重（默认已是 london2）",
+                    allow_custom_value=False,
+                )
+                device = gr.Radio(choices=["cpu", "0"], value="cpu", label="设备")
+                classes = gr.Textbox(
+                    value="0,1",
+                    label="检测类别 ID（自训练：0=人 1=车；仅当用 COCO 预训练才填 0,2）",
+                )
+                conf = gr.Slider(0.1, 0.9, value=0.25, step=0.05, label="置信度阈值（漏检多就调低）")
+                frame_stride = gr.Slider(1, 20, value=2, step=1, label="隔帧 stride（越大越快；计数不准就调小）")
+                max_frames = gr.Slider(0, 500, value=150, step=10, label="最多处理帧数（0=不限制；越大结果越长）")
+                playback_fps = gr.Slider(1, 15, value=4, step=1, label="输出播放帧率（越小越慢越长）")
+                use_deepsort = gr.Checkbox(value=False, label="使用 DeepSort（更准但 CPU 极慢，默认关闭）")
+                btn = gr.Button("开始检测计数", variant="primary")
+            with gr.Column(scale=2):
+                out_preview = gr.Image(label="处理后预览", type="numpy")
+                out_summary = gr.Textbox(label="进度 / 计数摘要", lines=10)
+                out_video = gr.File(label="处理后视频（跑完可下载）")
+
+        btn.click(
+            fn=run_detect,
+            inputs=[
+                video_in,
+                weight,
+                device,
+                classes,
+                conf,
+                frame_stride,
+                max_frames,
+                playback_fps,
+                use_deepsort,
+            ],
+            outputs=[out_preview, out_summary, out_video],
+        )
+    return demo
+
+
+if __name__ == '__main__':
+    import tempfile
+
+    opt = _build_default_opt()
+    demo = build_demo(opt)
+    repo = Path(__file__).resolve().parents[1]
+    demo.queue().launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        show_error=True,
+        allowed_paths=[
+            str(repo / "outputs"),
+            str(repo / "weights"),
+            str(repo / "video"),
+            str(repo / "code"),
+            tempfile.gettempdir(),
+        ],
+    )
