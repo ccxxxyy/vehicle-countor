@@ -15,11 +15,13 @@ trainval_percent = 0.9  #可自己修改
 train_percent = 0.8    #可自己修改
 xmlfilepath = opt.xml_path
 txtsavepath = opt.txt_path
-total_xml = os.listdir(xmlfilepath)
+total_xml = [f for f in os.listdir(xmlfilepath) if f.lower().endswith('.xml')]
 if not os.path.exists(txtsavepath):
     os.makedirs(txtsavepath)
 
 num = len(total_xml)
+if num == 0:
+    raise SystemExit(f'No XML found in {xmlfilepath}')
 list_index = range(num)
 tv = int(num * trainval_percent)
 tr = int(tv * train_percent)
