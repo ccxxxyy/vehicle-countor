@@ -82,18 +82,24 @@ class LineCrossingCounter:
         return int(h * self.line_ratio)
 
     @staticmethod
-    def _kind(class_name: str) -> str:
-        """返回 'person' | 'vehicle' | 'other'。"""
-        name = str(class_name).lower()
-        if name == "person":
+    def _kind(class_name: str, cls_id: int | None = None) -> str:
+        """返回 'person' | 'vehicle' | 'other'。自训练 2 类时 0=人 1=车。"""
+        name = str(class_name).lower().strip()
+        if name in ("person", "行人", "people", "pedestrian"):
             return "person"
-        if is_vehicle(name):
+        if is_vehicle(name) or name in ("车辆", "汽车"):
             return "vehicle"
+        # 类别名异常时按 ID 兜底（自定义模型：0 person / 1 car）
+        if cls_id is not None:
+            if int(cls_id) == 0:
+                return "person"
+            if int(cls_id) == 1:
+                return "vehicle"
         return "other"
 
-    def observe_track(self, track_id: int, class_name: str) -> None:
+    def observe_track(self, track_id: int, class_name: str, cls_id: int | None = None) -> None:
         tid = int(track_id)
-        kind = self._kind(class_name)
+        kind = self._kind(class_name, cls_id=cls_id)
         self._track_cls[tid] = str(class_name)
         if tid not in self._seen_ids:
             self._seen_ids.add(tid)
@@ -111,12 +117,13 @@ class LineCrossingCounter:
         bbox_xyxy,
         frame_h: int,
         class_name: str,
+        cls_id: int | None = None,
     ) -> Optional[str]:
         """若发生跨线返回方向 'up'|'down'，否则 None。"""
         tid = int(track_id)
         x1, y1, x2, y2 = map(float, bbox_xyxy[:4])
         cy = (y1 + y2) / 2.0
-        self.observe_track(tid, class_name)
+        self.observe_track(tid, class_name, cls_id=cls_id)
 
         ly = self.line_y(frame_h)
         prev = self._prev_cy.get(tid)
@@ -137,7 +144,7 @@ class LineCrossingCounter:
         self._counted_cross.add(key)
 
         self.crossed += 1
-        kind = self._kind(class_name)
+        kind = self._kind(class_name, cls_id=cls_id)
         if direction == "up":
             self.up += 1
             dir_cn = "向上"
@@ -162,11 +169,12 @@ class LineCrossingCounter:
         return direction
 
     def summary_text(self, person_now: int | None = None, vehicle_now: int | None = None) -> str:
-        """供 CLI / Gradio 显示的计数摘要。"""
+        """供 CLI / Gradio：以当前画面人数/车数为准。"""
         lines = []
         if person_now is not None and vehicle_now is not None:
             lines.append(f"当前画面：行人 {person_now} / 车辆 {vehicle_now}")
-        lines.append(f"累计出现：行人 {self.person_total} / 车辆 {self.vehicle_total}")
+        else:
+            lines.append(f"当前画面：行人 {self._last_person_now} / 车辆 {self._last_vehicle_now}")
         return "\n".join(lines)
 
 
@@ -179,22 +187,22 @@ def draw_id_box(
     label_extra: str = "",
 ) -> None:
     x1, y1, x2, y2 = map(int, bbox_xyxy[:4])
-    # ID 文字故意放大：预览缩到 960 宽后仍要一眼能看清
+    # 中等字号：能看清，又不过度挡住画面
     h = im.shape[0]
-    font_scale = max(1.35, h / 720.0 * 1.6)
-    thick = max(3, int(round(h / 720.0 * 4)))
+    font_scale = max(0.55, min(0.85, h / 720.0 * 0.7))
+    thick = max(2, int(round(h / 720.0 * 2)))
     cv2.rectangle(im, (x1, y1), (x2, y2), color, thick)
-    label = f"ID:{int(track_id)}"
-    if label_extra:
-        label = f"{label} {label_extra}"
-    (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thick)
-    pad = 10
-    ty = max(0, y1 - th - pad)
+    # 短标签：ID + 人/车（OpenCV 不画中文，用 P/C）
+    tag = label_extra if label_extra else ""
+    label = f"ID:{int(track_id)}" + (f" {tag}" if tag else "")
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thick)
+    pad = 4
+    ty = max(0, y1 - th - pad * 2)
     cv2.rectangle(im, (x1, ty), (x1 + tw + pad * 2, y1), color, -1)
     cv2.putText(
         im,
         label,
-        (x1 + pad, y1 - 8),
+        (x1 + pad, y1 - pad),
         cv2.FONT_HERSHEY_SIMPLEX,
         font_scale,
         (255, 255, 255),
@@ -215,16 +223,23 @@ def draw_osd_panel(im, person_now: int, vehicle_now: int) -> np.ndarray:
         f"车辆：{vehicle_now}",
     ]
 
-    font = _load_font(max(32, int(im.shape[0] / 720 * 36)))
-    pad_x, pad_y, line_h = 16, 14, 40
-    max_w = 0
-    for text in lines:
+    font_size = max(22, int(im.shape[0] / 720 * 24))
+    font = _load_font(font_size)
+    pad_x, pad_y = 14, 12
+    # 固定行距（字号+余量），中文字体用 getbbox 行高经常偏小会叠字
+    line_h = font_size + 20
+
+    def _text_width(text: str) -> int:
         try:
             bbox = font.getbbox(text)
-            tw = bbox[2] - bbox[0]
+            return max(1, bbox[2] - bbox[0])
         except Exception:
-            tw, _ = font.getsize(text)
-        max_w = max(max_w, tw)
+            try:
+                return int(font.getsize(text)[0])
+            except Exception:
+                return len(text) * font_size
+
+    max_w = max(_text_width(t) for t in lines)
     panel_w = max_w + pad_x * 2
     panel_h = pad_y * 2 + line_h * len(lines)
 
@@ -261,22 +276,28 @@ def render_frame(
 
     for t in tracks:
         x1, y1, x2, y2, tid, cls_id = t[:6]
-        c = int(cls_id)
+        c = int(float(cls_id))
         try:
-            name = names[c]
+            name = names[c] if not isinstance(names, dict) else names.get(c, names.get(str(c), str(c)))
         except Exception:
             name = str(c)
         # 累计仍记录（摘要用）；画面数字用当前帧
-        counter.update(int(tid), (x1, y1, x2, y2), h, name)
-        kind = counter._kind(name)
+        counter.update(int(tid), (x1, y1, x2, y2), h, name, cls_id=c)
+        kind = counter._kind(name, cls_id=c)
         if kind == "person":
             person_now += 1
+            tag = "P"
+            color = (80, 220, 80)  # 行人：绿
         elif kind == "vehicle":
             vehicle_now += 1
-        color = colors_fn(int(tid), True)
-        extra = class_cn(name)
-        draw_id_box(im, (x1, y1, x2, y2), int(tid), color, label_extra=extra)
+            tag = "C"
+            color = (60, 160, 255)  # 车辆：橙蓝
+        else:
+            tag = "?"
+            color = colors_fn(int(tid), True)
+        draw_id_box(im, (x1, y1, x2, y2), int(tid), color, label_extra=tag)
 
+    # 默认不画黄线（用户未要求撞线时不叠加）
     if draw_line:
         draw_yellow_line(im, counter.line_y(h), thickness=2)
     im = draw_osd_panel(im, person_now, vehicle_now)

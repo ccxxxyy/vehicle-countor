@@ -60,13 +60,228 @@ def _iou_xyxy(a, b) -> float:
     return float(inter / union) if union > 0 else 0.0
 
 
+def _nms_xyxy(boxes, scores, iou_thres: float = 0.5) -> list[int]:
+    """同类重叠框再压一遍。"""
+    if len(boxes) == 0:
+        return []
+    order = sorted(range(len(boxes)), key=lambda i: float(scores[i]), reverse=True)
+    keep = []
+    while order:
+        i = order.pop(0)
+        keep.append(i)
+        order = [j for j in order if _iou_xyxy(boxes[i], boxes[j]) < iou_thres]
+    return keep
+
+
+def _inter_over_smaller(a, b) -> float:
+    """交集 / 较小框面积；用于「大框套小框」去重。"""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    smaller = min(area_a, area_b)
+    return float(inter / smaller) if smaller > 0 else 0.0
+
+
+def _center_close(a, b, rel: float = 0.35) -> bool:
+    """两框中心是否过近（相对平均边长）。"""
+    ax = (a[0] + a[2]) * 0.5
+    ay = (a[1] + a[3]) * 0.5
+    bx = (b[0] + b[2]) * 0.5
+    by = (b[1] + b[3]) * 0.5
+    aw = max(1.0, a[2] - a[0])
+    ah = max(1.0, a[3] - a[1])
+    bw = max(1.0, b[2] - b[0])
+    bh = max(1.0, b[3] - b[1])
+    scale = 0.5 * ((aw + bw) * 0.5 + (ah + bh) * 0.5)
+    dist = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+    return dist < scale * rel
+
+
+def _filter_dets(boxes, scores, clss, min_side: float = 12.0, nms_iou: float = 0.35,
+                 frame_wh=None, custom_2cls: bool = True, person_min_conf: float = 0.0):
+    """去掉过小框 + 强力去重（防一车多框）。"""
+    if len(boxes) == 0:
+        return boxes, scores, clss
+    boxes = np.asarray(boxes, dtype=np.float32).copy()
+    scores = np.asarray(scores, dtype=np.float32).copy()
+    clss = np.asarray(clss, dtype=np.int32).copy()
+    fw = float(frame_wh[0]) if frame_wh else 1.0
+    fh = float(frame_wh[1]) if frame_wh else 1.0
+    frame_area = max(fw * fh, 1.0)
+
+    if custom_2cls:
+        for i in range(len(clss)):
+            x1, y1, x2, y2 = boxes[i]
+            bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+            ar = bw / bh
+            area_ratio = (bw * bh) / frame_area
+            if int(clss[i]) == 0:
+                if person_min_conf > 0 and float(scores[i]) < person_min_conf:
+                    scores[i] = -1.0
+                    continue
+                if ar >= 1.0 and area_ratio >= 0.04:
+                    clss[i] = 1
+                elif area_ratio >= 0.08:
+                    clss[i] = 1
+                elif ar <= 0.28 and bh > fh * 0.25:
+                    scores[i] = -1.0
+            elif int(clss[i]) == 1:
+                if ar <= 0.35 and bh > fh * 0.3:
+                    scores[i] = -1.0
+    else:
+        for i in range(len(clss)):
+            if int(clss[i]) == 0 and person_min_conf > 0 and float(scores[i]) < person_min_conf:
+                scores[i] = -1.0
+
+    valid = scores >= 0
+    boxes, scores, clss = boxes[valid], scores[valid], clss[valid]
+    if len(boxes) == 0:
+        return (
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    # 1) 按类 NMS：车严（防碎框），人松（并排人群别并掉）
+    keep_all = []
+    for c in np.unique(clss):
+        idx = np.where(clss == c)[0]
+        ok = [
+            k for k, box in enumerate(boxes[idx])
+            if (box[2] - box[0]) >= min_side and (box[3] - box[1]) >= min_side
+        ]
+        if not ok:
+            continue
+        idx = idx[ok]
+        # car 严去重；person 松（并排人群）
+        thr = 0.30 if int(c) == 1 else 0.55
+        local = _nms_xyxy(boxes[idx].tolist(), scores[idx].tolist(), iou_thres=thr)
+        keep_all.extend(idx[local].tolist())
+    if not keep_all:
+        return (
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.int32),
+        )
+    keep_all = sorted(keep_all)
+    boxes, scores, clss = boxes[keep_all], scores[keep_all], clss[keep_all]
+
+    # 2) 全局再压：车严；人只去掉几乎完全重叠的碎框（并排人群要保留）
+    order = sorted(range(len(boxes)), key=lambda i: float(scores[i]), reverse=True)
+    keep: list[int] = []
+    for i in order:
+        bi = boxes[i]
+        ai = float((bi[2] - bi[0]) * (bi[3] - bi[1]))
+        ci = int(clss[i])
+        drop_i = False
+        for j in keep:
+            bj = boxes[j]
+            aj = float((bj[2] - bj[0]) * (bj[3] - bj[1]))
+            cj = int(clss[j])
+            iou = _iou_xyxy(bi, bj)
+            ios = _inter_over_smaller(bi, bj)
+            same = ci == cj
+
+            if same and ci == 0:
+                # 人：只有高度重叠才去重（站一起的人 IoU 通常不高）
+                if iou < 0.55 and ios < 0.70:
+                    continue
+            elif same and ci == 1:
+                # 车：严去重
+                close = _center_close(bi, bj, rel=0.55)
+                if iou < 0.2 and ios < 0.35 and not close:
+                    continue
+            else:
+                # 跨类：主要压「人框盖在车上」
+                close = _center_close(bi, bj, rel=0.35)
+                if iou < 0.25 and ios < 0.45 and not close:
+                    continue
+                if ci == 1 and cj == 0 and ai > aj * 1.05:
+                    keep.remove(j)
+                    break
+                if ci == 0 and cj == 1:
+                    drop_i = True
+                    break
+                # 其它跨类：分高者已在 keep
+                if iou >= 0.25 or ios >= 0.45 or close:
+                    drop_i = True
+                    break
+                continue
+
+            # 同类需要抑制
+            drop_i = True
+            break
+        if not drop_i:
+            keep.append(i)
+    keep = sorted(keep)
+    return boxes[keep], scores[keep], clss[keep]
+
+
+def _dedup_tracks(tracks: np.ndarray, iou_thres: float = 0.3) -> np.ndarray:
+    """追踪后再压：车严、人松。"""
+    if tracks is None or len(tracks) == 0:
+        return np.empty((0, 6), dtype=np.float32)
+    tracks = np.asarray(tracks, dtype=np.float32)
+    n = len(tracks)
+    areas = (tracks[:, 2] - tracks[:, 0]) * (tracks[:, 3] - tracks[:, 1])
+    order = sorted(range(n), key=lambda i: float(areas[i]), reverse=True)
+    keep: list[int] = []
+    for i in order:
+        suppressed = False
+        replace = None
+        bi = tracks[i][:4]
+        ci = int(tracks[i][5])
+        for j in list(keep):
+            bj = tracks[j][:4]
+            cj = int(tracks[j][5])
+            iou = _iou_xyxy(bi, bj)
+            ios = _inter_over_smaller(bi, bj)
+            if ci == 0 and cj == 0:
+                # 人并排：不要因中心近就合并
+                if iou < 0.55 and ios < 0.70:
+                    continue
+                suppressed = True
+                break
+            if ci == 1 and cj == 1:
+                close = _center_close(bi, bj, rel=0.55)
+                if iou < iou_thres and ios < 0.35 and not close:
+                    continue
+                suppressed = True
+                break
+            # 跨类
+            close = _center_close(bi, bj, rel=0.35)
+            if iou < 0.25 and ios < 0.45 and not close:
+                continue
+            if ci == 1 and cj == 0:
+                replace = j
+                break
+            if ci == 0 and cj == 1:
+                suppressed = True
+                break
+            suppressed = True
+            break
+        if suppressed:
+            continue
+        if replace is not None:
+            keep.remove(replace)
+        keep.append(i)
+    return tracks[keep]
+
+
 class SimpleIoUTracker:
     """无 ReID 的轻量追踪（比 DeepSort 快一个数量级，适合 CPU / Gradio）。"""
 
-    def __init__(self, iou_thresh: float = 0.2, max_age: int = 40, dist_thresh: float = 0.15):
+    def __init__(self, iou_thresh: float = 0.1, max_age: int = 60, dist_thresh: float = 0.35):
         self.iou_thresh = iou_thresh
         self.max_age = max_age
-        self.dist_thresh = dist_thresh  # 中心点距离相对画面对角线
+        self.dist_thresh = dist_thresh  # 中心点距离相对画面对角线（放宽，减少换号）
         self.next_id = 1
         self.tracks = {}
 
@@ -96,8 +311,13 @@ class SimpleIoUTracker:
                 iou = _iou_xyxy(box, tr["box"])
                 tx, ty = self._center(tr["box"])
                 dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5 / diag
-                # IoU 优先；隔帧时 IoU 可能变小，用中心距离兜底
-                score = iou if iou >= self.iou_thresh else (1.0 - dist if dist <= self.dist_thresh else -1.0)
+                # IoU 优先；隔帧位移大时用中心距离兜底（阈值已放宽）
+                if iou >= self.iou_thresh:
+                    score = 1.0 + iou
+                elif dist <= self.dist_thresh:
+                    score = 1.0 - dist
+                else:
+                    score = -1.0
                 if score >= 0:
                     pairs.append((score, di, tid))
         pairs.sort(reverse=True)
@@ -177,8 +397,12 @@ def detect_fast(opt):
         pass
 
     COUNTER.reset()
-    # 隔帧较大时放宽关联，减少同一目标反复换 ID → 累计人数爆炸
-    tracker = SimpleIoUTracker(iou_thresh=0.15, max_age=max(40, frame_stride * 4), dist_thresh=0.2)
+    # 放宽关联：隔帧后同一人不要反复开新 ID
+    tracker = SimpleIoUTracker(
+        iou_thresh=0.08,
+        max_age=max(80, frame_stride * 8),
+        dist_thresh=0.4,
+    )
 
     # 始终写到仓库 outputs/，不要用权重绝对路径当目录名
     repo_root = Path(__file__).resolve().parents[1]
@@ -248,8 +472,18 @@ def detect_fast(opt):
         if det is not None and len(det):
             det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im_rs.shape).round()
             boxes = det[:, :4].detach().cpu().numpy()
-            clss = det[:, 5].detach().cpu().numpy()
-            tracks = tracker.update(boxes, clss, frame_wh=(out_w, out_h))
+            scores = det[:, 4].detach().cpu().numpy()
+            clss = det[:, 5].detach().cpu().numpy().astype(np.int32)
+            # 车在远景可能较小；并做形态纠错（宽大框勿标成人）
+            custom = "phase_d" in str(weight).replace("\\", "/").lower()
+            person_min = float(getattr(opt, "person_min_conf", 0.0) or 0.0)
+            boxes, scores, clss = _filter_dets(
+                boxes, scores, clss, min_side=8.0, nms_iou=0.30,
+                frame_wh=(out_w, out_h), custom_2cls=custom, person_min_conf=person_min,
+            )
+            if len(boxes):
+                tracks = tracker.update(boxes, clss, frame_wh=(out_w, out_h))
+                tracks = _dedup_tracks(tracks, iou_thres=0.28)
 
         rendered = render_frame(im_rs, tracks, names, COUNTER, colors, draw_line=False)
         writer.write(rendered)
@@ -442,20 +676,43 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
 
+                boxes = det[:, :4].detach().cpu().numpy()
+                confs_np = det[:, 4].detach().cpu().numpy()
+                clss_np = det[:, 5].detach().cpu().numpy().astype(np.int32)
+                custom = "phase_d" in str(yolo_model).replace("\\", "/").lower()
+                person_min = float(getattr(opt, "person_min_conf", 0.0) or 0.0)
+                boxes, confs_np, clss_np = _filter_dets(
+                    boxes, confs_np, clss_np, min_side=10.0, nms_iou=0.45,
+                    frame_wh=(w, h), custom_2cls=custom, person_min_conf=person_min,
+                )
+
                 # Print results
-                for c in det[:, -1].unique():
-                    n = (det[:, -1] == c).sum()  # detections per class
-                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                for c in np.unique(clss_np) if len(clss_np) else []:
+                    n = int((clss_np == c).sum())
+                    try:
+                        nm = names[int(c)]
+                    except Exception:
+                        nm = str(c)
+                    s += f"{n} {nm}{'s' * (n > 1)}, "
 
-                xywhs = xyxy2xywh(det[:, 0:4])
-                confs = det[:, 4]
-                clss = det[:, 5]
+                if len(boxes):
+                    xywhs = xyxy2xywh(torch.from_numpy(boxes))
+                    confs = torch.from_numpy(confs_np)
+                    clss = torch.from_numpy(clss_np).float()
 
-                # 将检测结果送到deepsort里面
-                t4 = time_sync()
-                outputs[i] = deepsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
-                t5 = time_sync()
-                dt[3] += t5 - t4
+                    # 将检测结果送到deepsort里面
+                    t4 = time_sync()
+                    outputs[i] = deepsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
+                    t5 = time_sync()
+                    dt[3] += t5 - t4
+                    outputs[i] = _dedup_tracks(
+                        np.asarray(outputs[i], dtype=np.float32) if len(outputs[i]) else np.empty((0, 6)),
+                        iou_thres=0.5,
+                    )
+                else:
+                    t4 = t5 = time_sync()
+                    outputs[i] = np.empty((0, 6))
+                    deepsort_list[i].increment_ages()
 
                 # 保存结果
                 if len(outputs[i]) > 0:
@@ -618,7 +875,8 @@ def _weight_choices() -> list[tuple[str, str]]:
     """返回 [(显示名, 绝对路径), ...]，便于下拉里认出 london2。"""
     repo = Path(__file__).resolve().parents[1]
     candidates = [
-        ("phase_d_london2（自训练 人/车，推荐）", repo / "outputs" / "runs" / "train" / "phase_d_london2" / "weights" / "best.pt"),
+        ("phase_d_london3（自训练 人/车+花车，推荐）", repo / "outputs" / "runs" / "train" / "phase_d_london3" / "weights" / "best.pt"),
+        ("phase_d_london2（自训练 人/车）", repo / "outputs" / "runs" / "train" / "phase_d_london2" / "weights" / "best.pt"),
         ("phase_d_london（自训练 人/车）", repo / "outputs" / "runs" / "train" / "phase_d_london" / "weights" / "best.pt"),
         ("phase_d（自训练 人/车）", repo / "outputs" / "runs" / "train" / "phase_d" / "weights" / "best.pt"),
         ("yolov5n（COCO 预训练，80类）", repo / "weights" / "yolov5n.pt"),
@@ -657,7 +915,8 @@ def build_demo(opt):
     label_to_path = {lab: path for lab, path in weight_list}
 
     def run_detect(
-        video, weight, device, classes_text, conf_thres, frame_stride, max_frames, playback_fps, use_deepsort
+        video, weight, device, classes_text, conf_thres, frame_stride, max_frames, playback_fps,
+        use_deepsort, vehicle_priority,
     ):
         if video is None:
             yield None, "请先上传视频文件，再点「开始检测计数」", None
@@ -668,6 +927,9 @@ def build_demo(opt):
         opt.device = device or "cpu"
         opt.classes = _parse_classes(classes_text)
         opt.conf_thres = float(conf_thres)
+        opt.iou_thres = 0.45  # YOLO NMS 更严，减少同车碎框
+        opt.agnostic_nms = True
+        opt.max_det = 100
         opt.show_vid = False
         opt.save_vid = True
         opt.exist_ok = True
@@ -675,10 +937,18 @@ def build_demo(opt):
         opt.frame_stride = int(frame_stride)
         opt.max_frames = int(max_frames)
         opt.playback_fps = float(playback_fps)
-        # 快速模式默认 416：比 320 准一点，仍比 640 快
-        opt.imgsz = [416, 416]
+        opt.person_min_conf = 0.0
 
-        # 自训练 2 类模型：只保留 人=0 / 车=1（忽略误填的 COCO 编号）
+        # 车辆优先：略降阈值抓弱车，但不要压到 0.15（会一车多框）
+        if vehicle_priority:
+            opt.conf_thres = min(max(opt.conf_thres, 0.2), 0.28)
+            opt.person_min_conf = 0.45
+            opt.imgsz = [640, 640]
+        elif use_deepsort:
+            opt.imgsz = [640, 640]
+        else:
+            opt.imgsz = [416, 416]
+
         wlow = weight_path.replace("\\", "/").lower()
         if "phase_d" in wlow:
             opt.classes = [0, 1]
@@ -703,12 +973,14 @@ def build_demo(opt):
             yield None, f"出错：{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}", None
 
     tips = (
-        "**推荐**：权重选 **phase_d_london2（自训练 人/车）**，类别填 **`0,1`**（0=人，1=车）。\n\n"
-        "**慢速预览**：默认隔 2 帧、最多 150 帧、播放约 4fps → 输出约 37 秒。"
+        "**花车漏检怎么办**\n"
+        "1. 勾选 **「车辆优先（花车/弱车）」**，置信度可再降到 0.15～0.2\n"
+        "2. 权重可试 `yolov5s（COCO）` + 类别 `0,2,5,7`（大巴更稳；花车仍可能难）\n"
+        "3. **根本办法**：多抽几帧把花车标成 `car`，再重新训练（现在车样本远少于人）\n"
     )
 
     with gr.Blocks(title="客流 / 车流计数") as demo:
-        gr.Markdown("# 客流 / 车流计数（YOLOv5）")
+        gr.Markdown("# 告诉车流量计数器")
         gr.Markdown(tips)
         with gr.Row():
             with gr.Column(scale=1):
@@ -720,19 +992,23 @@ def build_demo(opt):
                 weight = gr.Dropdown(
                     choices=weight_labels,
                     value=default_label,
-                    label="YOLO 权重（默认已是 london2）",
+                    label="YOLO 权重（默认 london3）",
                     allow_custom_value=False,
                 )
                 device = gr.Radio(choices=["cpu", "0"], value="cpu", label="设备")
                 classes = gr.Textbox(
                     value="0,1",
-                    label="检测类别 ID（自训练：0=人 1=车；仅当用 COCO 预训练才填 0,2）",
+                    label="检测类别 ID（0=人 1=车）",
                 )
-                conf = gr.Slider(0.1, 0.9, value=0.25, step=0.05, label="置信度阈值（漏检多就调低）")
+                conf = gr.Slider(0.1, 0.9, value=0.30, step=0.05, label="置信度（人少→略降；车多框→略升）")
                 frame_stride = gr.Slider(1, 20, value=2, step=1, label="隔帧 stride（越大越快；计数不准就调小）")
                 max_frames = gr.Slider(0, 500, value=150, step=10, label="最多处理帧数（0=不限制；越大结果越长）")
                 playback_fps = gr.Slider(1, 15, value=4, step=1, label="输出播放帧率（越小越慢越长）")
-                use_deepsort = gr.Checkbox(value=False, label="使用 DeepSort（更准但 CPU 极慢，默认关闭）")
+                vehicle_priority = gr.Checkbox(
+                    value=False,
+                    label="车辆优先（仅花车仍漏时勾选；勾选后更容易叠框）",
+                )
+                use_deepsort = gr.Checkbox(value=False, label="使用 DeepSort")
                 btn = gr.Button("开始检测计数", variant="primary")
             with gr.Column(scale=2):
                 out_preview = gr.Image(label="处理后预览", type="numpy")
@@ -751,6 +1027,7 @@ def build_demo(opt):
                 max_frames,
                 playback_fps,
                 use_deepsort,
+                vehicle_priority,
             ],
             outputs=[out_preview, out_summary, out_video],
         )

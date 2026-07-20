@@ -1,4 +1,9 @@
-D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\16.jpg
-D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_001.jpg
-D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_005.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\1.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_004.jpg
 D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_012.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_013.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_039.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_040.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_042.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_054.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_074.jpg
