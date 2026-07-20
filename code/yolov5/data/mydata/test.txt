@@ -1,4 +1,4 @@
-D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\15.jpg
 D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\16.jpg
-D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\5.jpg
 D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_001.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_005.jpg
+D:\PythonProjects\vehicle-countor\code\yolov5\data\mydata\images\london_012.jpg
