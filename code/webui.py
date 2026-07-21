@@ -767,15 +767,17 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
                     vid_path[i] = save_path
                     if isinstance(vid_writer[i], cv2.VideoWriter):
                         vid_writer[i].release()
+                    # 与叠加后的帧尺寸一致，避免黄线/OSD 写盘失败或花屏
+                    h_out, w_out = im0.shape[:2]
                     if vid_cap:
-                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        fps = vid_cap.get(cv2.CAP_PROP_FPS) or 25.0
                     else:
-                        fps, w, h = 30, im0.shape[1], im0.shape[0]
+                        fps = 30.0
                     save_path = str(Path(save_path).with_suffix('.mp4'))
                     last_saved_video = save_path
-                    vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    vid_writer[i] = cv2.VideoWriter(
+                        save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w_out, h_out)
+                    )
                 vid_writer[i].write(im0)
 
     for vw in vid_writer:
@@ -978,7 +980,11 @@ def build_demo(opt):
             ), None
 
     with gr.Blocks(title="高速车流量计数器") as demo:
-        gr.Markdown("# 高速车流量计数器")
+        gr.Markdown(
+            "# 高速车流量计数器\n"
+            "处理后画面会叠加：**斜向黄线**（撞线计数线）+ 左上角 OSD"
+            "（当前行人/车辆、**穿过黄线人数/车数**、**最新：人/车ID号向左或向右穿过黄线**）。"
+        )
         with gr.Row():
             with gr.Column(scale=1):
                 video_in = gr.File(

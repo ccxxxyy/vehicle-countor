@@ -266,8 +266,8 @@ def detect(opt):  # gradio可视化时需要加一个参数
         f'Count summary: total={COUNTER.total} '
         f'(person={COUNTER.person_total}, vehicle={COUNTER.vehicle_total}), '
         f'crossed={COUNTER.crossed} '
-        f'(person up/down={COUNTER.person_up}/{COUNTER.person_down}, '
-        f'vehicle up/down={COUNTER.vehicle_up}/{COUNTER.vehicle_down}), '
+        f'(person L/R={COUNTER.person_left}/{COUNTER.person_right}, '
+        f'vehicle L/R={COUNTER.vehicle_left}/{COUNTER.vehicle_right}), '
         f'latest={COUNTER.latest or "-"}'
     )
     return COUNTER
