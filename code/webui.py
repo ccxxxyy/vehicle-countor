@@ -40,7 +40,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-COUNTER = LineCrossingCounter(line_ratio=0.5)
+COUNTER = LineCrossingCounter()  # 默认斜线：人行道红绿灯侧 → 镜头旁栏杆
 
 # 全局缓存：避免每次点「开始」都重新加载 YOLO（很慢）
 _YOLO_CACHE = {}
@@ -482,7 +482,7 @@ def detect_fast(opt):
                 tracks = tracker.update(boxes, clss, frame_wh=(out_w, out_h))
                 tracks = _dedup_tracks(tracks, iou_thres=0.28)
 
-        rendered = render_frame(im_rs, tracks, names, COUNTER, colors, draw_line=False)
+        rendered = render_frame(im_rs, tracks, names, COUNTER, colors, draw_line=True)
         writer.write(rendered)
         last_rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
 
@@ -529,7 +529,6 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
         yield None, "正在加载模型与视频，请稍候…", None
 
     COUNTER.reset()
-    COUNTER.line_ratio = float(getattr(opt, 'line_ratio', 0.5))
 
     # Initialize（本项目固定 CPU）
     device = select_device(opt.device or "cpu")
@@ -738,9 +737,9 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
                 LOGGER.info('No detections')
                 outputs[i] = np.empty((0, 6))
 
-            # 黄线撞线 + ID 框 + 左上 OSD
+            # 斜向撞线 + ID 框 + 左上 OSD
             tracks = outputs[i] if outputs[i] is not None else np.empty((0, 6))
-            im0 = render_frame(im0, tracks, names, COUNTER, colors)
+            im0 = render_frame(im0, tracks, names, COUNTER, colors, draw_line=True)
 
             # Gradio：预览 Detection + 进度（每帧都更新摘要）
             if grstatus:

@@ -39,7 +39,7 @@ if str(ROOT) not in sys.path:
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 # 全局计数器（每次 detect 入口 reset）
-COUNTER = LineCrossingCounter(line_ratio=0.5)
+COUNTER = LineCrossingCounter()  # 默认斜线：人行道红绿灯侧 → 镜头旁栏杆
 
 def detect(opt):  # gradio可视化时需要加一个参数
     out, source, yolo_model, deep_sort_model, show_vid, save_vid, save_txt, imgsz, evaluate, half, \
@@ -50,8 +50,6 @@ def detect(opt):  # gradio可视化时需要加一个参数
         'rtsp') or source.startswith('http') or source.endswith('.txt')
 
     COUNTER.reset()
-    line_ratio = getattr(opt, 'line_ratio', 0.5)
-    COUNTER.line_ratio = float(line_ratio)
 
     # Initialize
     device = select_device(opt.device)   # 设备选择 cpu还是gpu
@@ -227,9 +225,9 @@ def detect(opt):  # gradio可视化时需要加一个参数
                 LOGGER.info('No detections')
                 outputs[i] = np.empty((0, 6))
 
-            # 黄线撞线 + ID 框 + 左上 OSD
+            # 斜向撞线 + ID 框 + 左上 OSD
             tracks = outputs[i] if outputs[i] is not None else np.empty((0, 6))
-            im0 = render_frame(im0, tracks, names, COUNTER, colors)
+            im0 = render_frame(im0, tracks, names, COUNTER, colors, draw_line=True)
 
             # 无头/无显示器环境禁止 imshow（E4）
             if show_vid:
