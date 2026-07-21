@@ -91,7 +91,7 @@ def _seg_intersect(p1, p2, q1, q2) -> bool:
 class LineCrossingCounter:
     """
     斜向撞线计数（伦敦街景默认线：人行道红绿灯侧 → 镜头旁栏杆）。
-    轨迹中心穿越该线段时计数一次；方向按 y 增减近似为向下/向上。
+    轨迹中心穿越该线段时计数一次；方向按 x 增减判定为向右/向左。
     """
 
     def __init__(
@@ -112,12 +112,19 @@ class LineCrossingCounter:
     def reset(self) -> None:
         self.total = 0
         self.crossed = 0
+        self.left = 0
+        self.right = 0
+        # 兼容旧字段名
         self.up = 0
         self.down = 0
         self.person_total = 0
         self.vehicle_total = 0
         self.person_crossed = 0
         self.vehicle_crossed = 0
+        self.person_left = 0
+        self.person_right = 0
+        self.vehicle_left = 0
+        self.vehicle_right = 0
         self.person_up = 0
         self.person_down = 0
         self.vehicle_up = 0
@@ -183,11 +190,13 @@ class LineCrossingCounter:
         cls_id: int | None = None,
         frame_w: int | None = None,
     ) -> Optional[str]:
-        """若穿越计数线返回方向 'up'|'down'，否则 None。"""
+        """若穿越计数线返回方向 'left'|'right'，否则 None。"""
         tid = int(track_id)
         x1, y1, x2, y2 = map(float, bbox_xyxy[:4])
+        kind = self._kind(class_name, cls_id=cls_id)
+        # 行人用脚点（底边中心），车辆用框中心，更贴近路面撞线
         cx = (x1 + x2) * 0.5
-        cy = (y1 + y2) * 0.5
+        cy = float(y2) if kind == "person" else (y1 + y2) * 0.5
         self.observe_track(tid, class_name, cls_id=cls_id)
 
         prev = self._prev_cxy.get(tid)
@@ -214,42 +223,53 @@ class LineCrossingCounter:
                 return None
             # 交点大致在线段范围内（用中点近似）
             mx, my = (p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5
-            # 到线段距离不要太远
+            # 到线段距离不要太远（隔帧时允许稍大）
             lx, ly = bx - ax, by - ay
             llen2 = lx * lx + ly * ly + 1e-6
             t = max(0.0, min(1.0, ((mx - ax) * lx + (my - ay) * ly) / llen2))
             nx, ny = ax + t * lx, ay + t * ly
-            if (mx - nx) ** 2 + (my - ny) ** 2 > (0.08 * max(w, h)) ** 2:
+            if (mx - nx) ** 2 + (my - ny) ** 2 > (0.12 * max(w, h)) ** 2:
                 return None
             crossed = True
         if not crossed:
             return None
 
         self._counted_cross.add(tid)
-        direction = "down" if cy >= prev[1] else "up"
+        # 以点的 x 变化判定左右（验收文案：向左/向右穿过黄线）
+        direction = "right" if cx >= prev[0] else "left"
         self.crossed += 1
-        kind = self._kind(class_name, cls_id=cls_id)
-        if direction == "up":
-            self.up += 1
-            dir_cn = "向上"
+        if direction == "right":
+            self.right += 1
+            self.down = self.right  # 兼容旧字段
+            dir_cn = "向右"
             if kind == "person":
-                self.person_up += 1
+                self.person_right += 1
+                self.person_down = self.person_right
                 self.person_crossed += 1
             elif kind == "vehicle":
-                self.vehicle_up += 1
+                self.vehicle_right += 1
+                self.vehicle_down = self.vehicle_right
                 self.vehicle_crossed += 1
         else:
-            self.down += 1
-            dir_cn = "向下"
+            self.left += 1
+            self.up = self.left  # 兼容旧字段
+            dir_cn = "向左"
             if kind == "person":
-                self.person_down += 1
+                self.person_left += 1
+                self.person_up = self.person_left
                 self.person_crossed += 1
             elif kind == "vehicle":
-                self.vehicle_down += 1
+                self.vehicle_left += 1
+                self.vehicle_up = self.vehicle_left
                 self.vehicle_crossed += 1
 
-        cn = class_cn(class_name)
-        self.latest = f"最新：{cn} {tid} 号{dir_cn}穿过计数线"
+        if kind == "person":
+            who = f"人{tid}号"
+        elif kind == "vehicle":
+            who = f"车{tid}号"
+        else:
+            who = f"{class_cn(class_name)}{tid}号"
+        self.latest = f"最新：{who}{dir_cn}穿过黄线"
         return direction
 
     def summary_text(self, person_now: int | None = None, vehicle_now: int | None = None) -> str:
@@ -260,8 +280,8 @@ class LineCrossingCounter:
             vehicle_now = self._last_vehicle_now
         lines = [
             f"当前画面：行人 {person_now} / 车辆 {vehicle_now}",
-            f"穿过计数线：行人 {self.person_crossed} / 车辆 {self.vehicle_crossed}",
-            f"方向：向上 {self.up} / 向下 {self.down}",
+            f"穿过黄线：人数 {self.person_crossed} / 车数 {self.vehicle_crossed}",
+            f"方向：向左 {self.left} / 向右 {self.right}",
         ]
         if self.latest:
             lines.append(self.latest)
@@ -301,10 +321,26 @@ def draw_id_box(
 
 def draw_count_line(im, x1: int, y1: int, x2: int, y2: int, thickness: int = 3) -> None:
     """绘制斜向计数线（黄线，位置对齐验收手绘红线）。"""
-    cv2.line(im, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), thickness, cv2.LINE_AA)
-    # 端点小圆，便于辨认起止
-    cv2.circle(im, (int(x1), int(y1)), max(4, thickness + 1), (0, 255, 255), -1, cv2.LINE_AA)
-    cv2.circle(im, (int(x2), int(y2)), max(4, thickness + 1), (0, 255, 255), -1, cv2.LINE_AA)
+    p1 = (int(x1), int(y1))
+    p2 = (int(x2), int(y2))
+    # 夜景：先画黑边再画黄线，避免被霓虹/路面吞掉
+    cv2.line(im, p1, p2, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    cv2.line(im, p1, p2, (0, 255, 255), thickness, cv2.LINE_AA)
+    r = max(5, thickness + 2)
+    cv2.circle(im, p1, r + 2, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(im, p2, r + 2, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(im, p1, r, (0, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(im, p2, r, (0, 255, 255), -1, cv2.LINE_AA)
+
+
+def _draw_text_stroke(draw: ImageDraw.ImageDraw, xy, text: str, font, fill, stroke=(0, 0, 0)) -> None:
+    x, y = xy
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            draw.text((x + dx, y + dy), text, font=font, fill=stroke)
+    draw.text((x, y), text, font=font, fill=fill)
 
 
 def draw_osd_panel(
@@ -315,20 +351,22 @@ def draw_osd_panel(
     vehicle_crossed: int = 0,
     latest: str = "",
 ) -> np.ndarray:
-    """左上半透明中文面板。"""
+    """左上半透明中文面板：当前人数/车数 + 过线累计 + 最新过线事件。"""
     lines = [
         f"行人：{person_now}",
         f"车辆：{vehicle_now}",
-        f"过线行人：{person_crossed}",
-        f"过线车辆：{vehicle_crossed}",
+        f"穿过黄线人数：{person_crossed}",
+        f"穿过黄线车数：{vehicle_crossed}",
     ]
     if latest:
         lines.append(latest)
+    else:
+        lines.append("最新：暂无")
 
-    font_size = max(20, int(im.shape[0] / 720 * 22))
+    font_size = max(22, int(im.shape[0] / 720 * 24))
     font = _load_font(font_size)
     pad_x, pad_y = 14, 12
-    line_h = font_size + 18
+    line_h = font_size + 16
 
     def _text_width(text: str) -> int:
         try:
@@ -346,15 +384,15 @@ def draw_osd_panel(
 
     overlay = im.copy()
     cv2.rectangle(overlay, (8, 8), (8 + panel_w, 8 + panel_h), (0, 0, 0), -1)
-    im = cv2.addWeighted(overlay, 0.55, im, 0.45, 0)
+    im = cv2.addWeighted(overlay, 0.62, im, 0.38, 0)
 
     rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
     draw = ImageDraw.Draw(pil)
     y = 8 + pad_y
     for text in lines:
-        fill = (255, 80, 80) if text.startswith("最新") else (255, 255, 255)
-        draw.text((8 + pad_x, y), text, font=font, fill=fill)
+        fill = (255, 90, 90) if text.startswith("最新") else (255, 255, 255)
+        _draw_text_stroke(draw, (8 + pad_x, y), text, font, fill)
         y += line_h
     return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
@@ -400,7 +438,7 @@ def render_frame(
 
     if draw_line:
         ax, ay, bx, by = counter.line_xyxy(w, h)
-        draw_count_line(im, ax, ay, bx, by, thickness=max(2, int(round(h / 720.0 * 3))))
+        draw_count_line(im, ax, ay, bx, by, thickness=max(3, int(round(h / 720.0 * 4))))
 
     im = draw_osd_panel(
         im,
