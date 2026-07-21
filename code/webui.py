@@ -7,6 +7,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import copy
+import html
 import sys
 
 sys.path.insert(0, './yolov5')
@@ -385,11 +386,7 @@ def detect_fast(opt):
     imgsz = int(getattr(opt, "imgsz", [320])[0] if isinstance(opt.imgsz, list) else getattr(opt, "imgsz", 320))
     imgsz = check_img_size(imgsz, s=32)
 
-    yield None, (
-        f"快速模式：跳过 DeepSort。\n"
-        f"隔帧={frame_stride}，最多={max_frames or '不限'}，输入={imgsz}，设备={device}\n"
-        f"正在加载/复用模型…"
-    ), None
+    yield None, "正在加载模型…", None
 
     model, stride, names, pt = _get_cached_yolo(weight, device, getattr(opt, "dnn", False))
     if isinstance(names, dict):
@@ -490,16 +487,11 @@ def detect_fast(opt):
         last_rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
 
         elapsed = time.time() - t_all0
-        fps_eff = processed / elapsed if elapsed > 0 else 0
         summary = (
-            f"快速模式运行中\n"
-            f"已处理 {processed}"
-            + (f"/{max_frames}" if max_frames > 0 else "")
-            + f" 帧 | 源进度 #{frame_idx}"
-            + (f"/{total}" if total else "")
-            + f" | 约 {fps_eff:.2f} 处理帧/秒\n"
+            f"处理中：已处理 {processed}"
+            + (f" / {max_frames}" if max_frames > 0 else "")
+            + " 帧\n"
             + COUNTER.summary_text(COUNTER._last_person_now, COUNTER._last_vehicle_now)
-            + "\n（画面左上数字=当前帧人数/车数）"
         )
         yield last_rgb, summary, None
 
@@ -507,7 +499,7 @@ def detect_fast(opt):
     writer.release()
     elapsed = time.time() - t_all0
     done = (
-        f"完成（快速模式）。耗时 {elapsed:.1f}s，处理 {processed} 帧。\n"
+        f"完成。耗时 {elapsed:.1f}s，共处理 {processed} 帧。\n"
         f"{COUNTER.summary_text(COUNTER._last_person_now, COUNTER._last_vehicle_now)}\n\n"
         f"视频已保存：{out_path}"
     )
@@ -539,9 +531,9 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
     COUNTER.reset()
     COUNTER.line_ratio = float(getattr(opt, 'line_ratio', 0.5))
 
-    # Initialize
-    device = select_device(opt.device)  # 设备选择 cpu还是gpu
-    half &= device.type != 'cpu'  # 半精度
+    # Initialize（本项目固定 CPU）
+    device = select_device(opt.device or "cpu")
+    half &= device.type != 'cpu'  # CPU 下不会启用半精度
 
     # The MOT16 evaluation runs multiple inference streams in parallel, each one writing to
     # its own .txt file. Hence, in that case, the output folder is not restored
@@ -551,7 +543,7 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
             shutil.rmtree(out)  # 删掉输出文件夹
         os.makedirs(out)  # # 新建输出文件夹
 
-    # Directories（必须用 stem，不能用绝对路径字符串，否则会写到 weights/ 下）
+    # Directories（必须用 stem，不能用绝对路径字符串，否则f会写到 weights/ 下）
     if type(yolo_model) is str:
         exp_name = Path(yolo_model).stem
     elif type(yolo_model) is list and len(yolo_model) == 1:
@@ -754,10 +746,13 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
             if grstatus:
                 last_det_rgb = cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
                 progress = (
-                    f"处理中：第 {processed} 帧"
-                    + (f" / 最多 {max_frames}" if max_frames > 0 else "")
-                    + f"（源帧 #{frame_idx}，步长 {frame_stride}）\n"
-                    + COUNTER.summary_text()
+                    f"处理中：已处理 {processed}"
+                    + (f" / {max_frames}" if max_frames > 0 else "")
+                    + " 帧\n"
+                    + COUNTER.summary_text(
+                        getattr(COUNTER, "_last_person_now", None),
+                        getattr(COUNTER, "_last_vehicle_now", None),
+                    )
                 )
                 if processed == 1 or processed % max(1, preview_every) == 0:
                     yield last_det_rgb, progress, None
@@ -801,12 +796,15 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
         strip_optimizer(yolo_model)  # update model (to fix SourceChangeWarning)
 
     if grstatus:
+        final = COUNTER.summary_text(
+            getattr(COUNTER, "_last_person_now", None),
+            getattr(COUNTER, "_last_vehicle_now", None),
+        )
+        if last_saved_video:
+            final = f"{final}\n\n视频已保存：{last_saved_video}"
         yield (
             last_det_rgb,
-            COUNTER.summary_text(
-                getattr(COUNTER, "_last_person_now", None),
-                getattr(COUNTER, "_last_vehicle_now", None),
-            ),
+            final,
             _to_gradio_file(last_saved_video),
         )
 
@@ -821,12 +819,12 @@ def _build_default_opt():
     parser.add_argument('--conf-thres', type=float, default=0.5, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
-    parser.add_argument('--device', default='cpu', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--device', default='cpu', help='本项目固定使用 CPU')
     parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
     parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
     parser.add_argument('--save-txt', action='store_true', help='save MOT compliant results to *.txt')
-    parser.add_argument('--classes', nargs='+', type=int, default=[0, 2, 5, 7],
-                        help='filter by class: person/car/bus/truck')
+    parser.add_argument('--classes', nargs='+', type=int, default=[0, 1],
+                        help='自训练类别: 0=person 1=car')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--update', action='store_true', help='update all models')
@@ -866,27 +864,20 @@ def _as_video_path(video) -> str:
 def _parse_classes(text: str):
     text = (text or "").strip()
     if not text:
-        return [0, 2, 5, 7]
+        return [0, 1]
     parts = [p for p in text.replace(",", " ").split() if p]
     return [int(p) for p in parts]
 
 
 def _weight_choices() -> list[tuple[str, str]]:
-    """返回 [(显示名, 绝对路径), ...]，便于下拉里认出 london2。"""
+    """仅保留当前正式权重 london3。"""
     repo = Path(__file__).resolve().parents[1]
-    candidates = [
-        ("phase_d_london3（自训练 人/车+花车，推荐）", repo / "outputs" / "runs" / "train" / "phase_d_london3" / "weights" / "best.pt"),
-        ("phase_d_london2（自训练 人/车）", repo / "outputs" / "runs" / "train" / "phase_d_london2" / "weights" / "best.pt"),
-        ("phase_d_london（自训练 人/车）", repo / "outputs" / "runs" / "train" / "phase_d_london" / "weights" / "best.pt"),
-        ("phase_d（自训练 人/车）", repo / "outputs" / "runs" / "train" / "phase_d" / "weights" / "best.pt"),
-        ("yolov5n（COCO 预训练，80类）", repo / "weights" / "yolov5n.pt"),
-        ("yolov5s（COCO 预训练，80类）", repo / "weights" / "yolov5s.pt"),
-    ]
-    found = [(label, str(p.resolve())) for label, p in candidates if p.exists()]
-    if not found:
-        p = (repo / "weights" / "yolov5n.pt").resolve()
-        found = [("yolov5n（COCO）", str(p))]
-    return found
+    london3 = repo / "outputs" / "runs" / "train" / "phase_d_london3" / "weights" / "best.pt"
+    if london3.exists():
+        return [("london3（人/车）", str(london3.resolve()))]
+    # 兜底：权重缺失时才露出预训练
+    fallback = repo / "weights" / "yolov5n.pt"
+    return [("yolov5n（兜底）", str(fallback.resolve()))]
 
 
 def _resolve_weight(weight) -> str:
@@ -895,39 +886,59 @@ def _resolve_weight(weight) -> str:
         return str(weight[1])
     s = str(weight or "").strip()
     for label, path in _weight_choices():
-        if s == label or s == path or Path(s).name == Path(path).name and "phase_d" in path:
-            if s == label or s == path:
-                return path
-    # 显示名模糊匹配
+        if s == label or s == path:
+            return path
     for label, path in _weight_choices():
         if s in label or label in s:
             return path
     return s
 
 
+def _status_html(text: str, spinning: bool = False) -> str:
+    """放大摘要文字；未完成时显示转圈。"""
+    safe = (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br>")
+    )
+    spinner = ""
+    if spinning:
+        spinner = (
+            '<span style="display:inline-block;width:22px;height:22px;'
+            "border:3px solid #d1d5db;border-top-color:#2563eb;border-radius:50%;"
+            'animation:vcspin .75s linear infinite;vertical-align:middle;margin-right:12px;"></span>'
+            "<style>@keyframes vcspin{to{transform:rotate(360deg)}}</style>"
+        )
+    style = (
+        "font-size:22px;line-height:1.7;"
+        "font-family:Microsoft YaHei,PingFang SC,sans-serif;padding:6px 2px;"
+    )
+    return f'<div style="{style}">{spinner}<span style="vertical-align:middle;">{safe}</span></div>'
+
+
 def build_demo(opt):
     import gradio as gr
 
-    weight_list = _weight_choices()  # [(label, path), ...]
+    weight_list = _weight_choices()
     default_label, default_path = weight_list[0]
-    # Gradio Dropdown：用 label 作 choices，内部再映射到路径
     weight_labels = [lab for lab, _ in weight_list]
     label_to_path = {lab: path for lab, path in weight_list}
 
     def run_detect(
-        video, weight, device, classes_text, conf_thres, frame_stride, max_frames, playback_fps,
-        use_deepsort, vehicle_priority,
+        video, weight, classes_text, conf_thres, frame_stride, max_frames, playback_fps, use_deepsort
     ):
         if video is None:
-            yield None, "请先上传视频文件，再点「开始检测计数」", None
+            yield None, _status_html("请先上传视频文件，再点「开始检测计数」"), None
             return
         weight_path = label_to_path.get(str(weight), _resolve_weight(weight))
         opt.source = _as_video_path(video)
         opt.yolo_model = [weight_path]
-        opt.device = device or "cpu"
+        opt.device = "cpu"  # 本项目固定 CPU
         opt.classes = _parse_classes(classes_text)
         opt.conf_thres = float(conf_thres)
-        opt.iou_thres = 0.45  # YOLO NMS 更严，减少同车碎框
+        opt.iou_thres = 0.45
         opt.agnostic_nms = True
         opt.max_det = 100
         opt.show_vid = False
@@ -938,19 +949,10 @@ def build_demo(opt):
         opt.max_frames = int(max_frames)
         opt.playback_fps = float(playback_fps)
         opt.person_min_conf = 0.0
-
-        # 车辆优先：略降阈值抓弱车，但不要压到 0.15（会一车多框）
-        if vehicle_priority:
-            opt.conf_thres = min(max(opt.conf_thres, 0.2), 0.28)
-            opt.person_min_conf = 0.45
-            opt.imgsz = [640, 640]
-        elif use_deepsort:
-            opt.imgsz = [640, 640]
-        else:
-            opt.imgsz = [416, 416]
+        opt.imgsz = [640, 640] if use_deepsort else [416, 416]
 
         wlow = weight_path.replace("\\", "/").lower()
-        if "phase_d" in wlow:
+        if "phase_d" in wlow or "london3" in wlow:
             opt.classes = [0, 1]
 
         out_video = None
@@ -958,30 +960,26 @@ def build_demo(opt):
         summary = ""
         try:
             with torch.no_grad():
-                if use_deepsort:
-                    gen = detect(opt, grstatus=True)
-                else:
-                    gen = detect_fast(opt)
+                gen = detect(opt, grstatus=True) if use_deepsort else detect_fast(opt)
                 for preview, summary, video_path in gen:
                     if video_path:
                         out_video = video_path
-                    yield preview, summary, out_video
+                    yield preview, _status_html(summary or "", spinning=(video_path is None)), out_video
             if out_video:
-                yield preview, (summary or "") + f"\n\n完成。视频：{out_video}", out_video
+                final_text = summary or ""
+                if "视频已保存" not in final_text:
+                    final_text = f"{final_text}\n\n视频已保存：{out_video}"
+                if "处理完成" not in final_text and "完成。" not in final_text:
+                    final_text = f"{final_text}\n\n处理完成。"
+                yield preview, _status_html(final_text, spinning=False), out_video
         except Exception as e:
             import traceback
-            yield None, f"出错：{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}", None
+            yield None, _status_html(
+                f"出错：{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}"
+            ), None
 
-    tips = (
-        "**花车漏检怎么办**\n"
-        "1. 勾选 **「车辆优先（花车/弱车）」**，置信度可再降到 0.15～0.2\n"
-        "2. 权重可试 `yolov5s（COCO）` + 类别 `0,2,5,7`（大巴更稳；花车仍可能难）\n"
-        "3. **根本办法**：多抽几帧把花车标成 `car`，再重新训练（现在车样本远少于人）\n"
-    )
-
-    with gr.Blocks(title="客流 / 车流计数") as demo:
-        gr.Markdown("# 告诉车流量计数器")
-        gr.Markdown(tips)
+    with gr.Blocks(title="高速车流量计数器") as demo:
+        gr.Markdown("# 高速车流量计数器")
         with gr.Row():
             with gr.Column(scale=1):
                 video_in = gr.File(
@@ -992,27 +990,19 @@ def build_demo(opt):
                 weight = gr.Dropdown(
                     choices=weight_labels,
                     value=default_label,
-                    label="YOLO 权重（默认 london3）",
+                    label="YOLO 权重",
                     allow_custom_value=False,
                 )
-                device = gr.Radio(choices=["cpu", "0"], value="cpu", label="设备")
-                classes = gr.Textbox(
-                    value="0,1",
-                    label="检测类别 ID（0=人 1=车）",
-                )
-                conf = gr.Slider(0.1, 0.9, value=0.30, step=0.05, label="置信度（人少→略降；车多框→略升）")
+                classes = gr.Textbox(value="0,1", label="检测类别 ID（0=人，1=车）")
+                conf = gr.Slider(0.1, 0.9, value=0.2, step=0.05, label="置信度（人少→略降；车多框→略升）")
                 frame_stride = gr.Slider(1, 20, value=2, step=1, label="隔帧 stride（越大越快；计数不准就调小）")
-                max_frames = gr.Slider(0, 500, value=150, step=10, label="最多处理帧数（0=不限制；越大结果越长）")
-                playback_fps = gr.Slider(1, 15, value=4, step=1, label="输出播放帧率（越小越慢越长）")
-                vehicle_priority = gr.Checkbox(
-                    value=False,
-                    label="车辆优先（仅花车仍漏时勾选；勾选后更容易叠框）",
-                )
+                max_frames = gr.Slider(0, 800, value=350, step=10, label="最多处理帧数（0=不限制；越大结果越长）")
+                playback_fps = gr.Slider(1, 15, value=2, step=1, label="输出播放帧率（越小越慢越长）")
                 use_deepsort = gr.Checkbox(value=False, label="使用 DeepSort")
                 btn = gr.Button("开始检测计数", variant="primary")
             with gr.Column(scale=2):
                 out_preview = gr.Image(label="处理后预览", type="numpy")
-                out_summary = gr.Textbox(label="进度 / 计数摘要", lines=10)
+                out_summary = gr.HTML(label="进度 / 计数摘要", value=_status_html("上传视频后点击开始"))
                 out_video = gr.File(label="处理后视频（跑完可下载）")
 
         btn.click(
@@ -1020,14 +1010,12 @@ def build_demo(opt):
             inputs=[
                 video_in,
                 weight,
-                device,
                 classes,
                 conf,
                 frame_stride,
                 max_frames,
                 playback_fps,
                 use_deepsort,
-                vehicle_priority,
             ],
             outputs=[out_preview, out_summary, out_video],
         )
