@@ -64,7 +64,6 @@ class Calibrator(trt.IInt8EntropyCalibrator2):
         batch = self.data_loader.next_batch()
         if not batch.size:
             return None
-        # 把校准数据从CPU搬运到GPU中
         cuda.memcpy_htod(self.d_input, batch)
 
         return [self.d_input]

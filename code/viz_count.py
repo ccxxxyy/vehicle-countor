@@ -8,7 +8,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-# COCO / 常见类别 -> 中文展示名
 CLASS_CN = {
     "person": "行人",
     "bicycle": "自行车",
@@ -28,8 +27,8 @@ _FONT_CANDIDATES = [
     Path(r"C:\Windows\Fonts\simsun.ttc"),
 ]
 
-# 伦敦测试视频默认计数线（归一化坐标 0~1）
-# 左=近景灯柱底部；右=赌场外墙 LED 屏正下方人行道地面（对齐手绘红线）
+# 伦敦视频默认计数线（归一化坐标 0~1）
+# 左=近景灯柱底部；右=赌场外墙 LED 屏正下方人行道地面
 DEFAULT_LINE_NORM = (0.755, 0.64, 0.04, 0.92)
 
 
@@ -89,15 +88,17 @@ def _seg_intersect(p1, p2, q1, q2) -> bool:
 
 class LineCrossingCounter:
     """
-    斜向撞线计数（伦敦街景默认线：路缘侧 → 镜头旁灯柱底部）。
+    斜向撞线计数。
     轨迹穿越该线段时计数一次；方向按穿越前后位移的 x 分量判定向左/向右。
-    需连续观察若干帧且位移足够，抑制灯柱假人、闪框误撞线。
     """
 
-    # 至少观察这么多帧才允许撞线计数（抑制新 ID 一出现就误计）
-    MIN_HITS = 3
-    # 穿越前后位移至少占画面对角线比例（隔帧时别太严）
+    # 抑制新 ID 出现就误计
+    MIN_HITS = 4
     MIN_TRAVEL_FRAC = 0.012
+    # 普通车：脚点到黄线超过该比例不算「已到线」
+    VEHICLE_NEAR_FRAC = 0.028
+    # 超大目标（大巴）启用贴线横向位移兜底
+    HUGE_AREA_FRAC = 0.12
 
     def __init__(
         self,
@@ -213,7 +214,6 @@ class LineCrossingCounter:
         diag = float((w * w + h * h) ** 0.5) or 1.0
         area_ratio = (bw * bh) / max(float(w * h), 1.0)
 
-        # 抑制灯柱/细条假人：过瘦、过小、贴边碎框不计撞线
         if kind == "person":
             ar = bw / bh
             if ar < 0.22 or bw < 0.012 * w or bh < 0.04 * h:
@@ -251,12 +251,23 @@ class LineCrossingCounter:
 
         p0 = (float(prev[0]), float(prev[1]))
         p1 = (cx, cy)
-        # 方向只用穿越当帧位移，避免 ID 抖动/长历史把「向左」判成「向右」
-        dx = p1[0] - p0[0]
-        dy = p1[1] - p0[1]
+        lx, ly = float(bx - ax), float(by - ay)
+        llen2 = lx * lx + ly * ly + 1e-6
+
+        def _dist_point_to_seg(px: float, py: float) -> float:
+            t = max(0.0, min(1.0, ((px - ax) * lx + (py - ay) * ly) / llen2))
+            nx, ny = ax + t * lx, ay + t * ly
+            return float(((px - nx) ** 2 + (py - ny) ** 2) ** 0.5)
+
+        dist_now = _dist_point_to_seg(cx, cy)
+        near_lim = self.VEHICLE_NEAR_FRAC * max(w, h)
+
+        # 方向：用最近若干帧横向位移
+        i0 = max(0, len(hist) - 6)
+        dx = float(hist[-1][0] - hist[i0][0])
+        dy = float(hist[-1][1] - hist[i0][1])
         step = (dx * dx + dy * dy) ** 0.5
 
-        # 相对首帧侧翻：适合巴士一进画就压线、中心缓慢挪过线的情况
         first = self._first_side.get(tid)
         side_flip = (
             first is not None
@@ -264,50 +275,54 @@ class LineCrossingCounter:
             and (side_now > 0) != (first > 0)
         )
 
+        # —— 主规则：脚点轨迹与黄线相交（真正穿过）——
         crossed = _seg_intersect(p0, p1, q0, q1)
         if not crossed:
             s0 = _side(p0[0], p0[1], q0[0], q0[1], q1[0], q1[1])
             s1 = side_now
             if s0 != 0 and s1 != 0 and (s0 > 0) != (s1 > 0):
+                # 侧翻且中点贴近线段才认（避免远处抖动假侧翻）
                 mx, my = (p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5
-                lx, ly = bx - ax, by - ay
-                llen2 = lx * lx + ly * ly + 1e-6
-                t = max(0.0, min(1.0, ((mx - ax) * lx + (my - ay) * ly) / llen2))
-                nx, ny = ax + t * lx, ay + t * ly
-                if (mx - nx) ** 2 + (my - ny) ** 2 <= (0.08 * max(w, h)) ** 2:
+                if _dist_point_to_seg(mx, my) <= 0.045 * max(w, h):
                     crossed = True
-            # 大目标（大巴/近景大人）：侧翻 + 累计位移够即可
-            if not crossed and side_flip and area_ratio >= 0.05:
-                hx0, hy0 = hist[0]
-                travel = ((cx - hx0) ** 2 + (cy - hy0) ** 2) ** 0.5
-                if travel >= self.MIN_TRAVEL_FRAC * diag * 0.8:
-                    crossed = True
-                    dx = cx - hx0
-                    dy = cy - hy0
 
-        # 大巴/贴镜头近景人：一进画底边已压线，用「底边贴线 + 横向位移」计数
-        if not crossed and area_ratio >= 0.03:
-            hx0, hy0 = hist[0]
-            travel_x = abs(cx - hx0)
-            bottom_hits_line = _seg_intersect((x1, y2), (x2, y2), q0, q1)
-            lx, ly = bx - ax, by - ay
-            llen2 = lx * lx + ly * ly + 1e-6
-            t = max(0.0, min(1.0, ((cx - ax) * lx + (cy - ay) * ly) / llen2))
-            nx, ny = ax + t * lx, ay + t * ly
-            near_line = (cx - nx) ** 2 + (cy - ny) ** 2 <= (0.10 * max(w, h)) ** 2
-            # 近景人框常盖住黄线整段：框与黄线有交集也算贴线
-            box_covers_line = (
+        # —— 车辆：禁止「离线很远」的 near/盖线兜底——
+        if not crossed and kind == "vehicle":
+            bottom_hits = _seg_intersect((x1, y2), (x2, y2), q0, q1)
+            # 普通车：必须脚点已贴线 + 侧翻（或底边撞线）
+            if dist_now <= near_lim and (side_flip or bottom_hits) and step >= self.MIN_TRAVEL_FRAC * diag * 0.5:
+                crossed = True
+            # 大巴：底边已压线 + 足够横向位移
+            elif area_ratio >= self.HUGE_AREA_FRAC and bottom_hits:
+                travel_x = abs(cx - hist[0][0])
+                if travel_x >= 0.04 * w:
+                    crossed = True
+                    dx = float(cx - hist[0][0])
+                    dy = float(cy - hist[0][1])
+
+        # —— 行人：保留近景贴线兜底（近景人一进画就压线）——
+        if not crossed and kind == "person":
+            bottom_hits = _seg_intersect((x1, y2), (x2, y2), q0, q1)
+            box_covers = (
                 min(x2, max(ax, bx)) >= max(x1, min(ax, bx))
                 and min(y2, max(ay, by)) >= max(y1, min(ay, by))
             )
-            if (bottom_hits_line or near_line or (area_ratio >= 0.08 and box_covers_line)) and travel_x >= 0.035 * w:
+            travel_x = abs(cx - hist[0][0])
+            if area_ratio >= 0.05 and (bottom_hits or (box_covers and dist_now <= 0.06 * max(w, h))):
+                if travel_x >= 0.03 * w:
+                    crossed = True
+                    dx = float(cx - hist[0][0])
+                    dy = float(cy - hist[0][1])
+            elif side_flip and dist_now <= 0.05 * max(w, h) and step >= self.MIN_TRAVEL_FRAC * diag * 0.4:
                 crossed = True
-                dx = cx - hx0
-                dy = cy - hy0
 
         if not crossed:
             return None
-        if step < self.MIN_TRAVEL_FRAC * diag * 0.35 and not side_flip and area_ratio < 0.03:
+        # 位移过小：框抖动不计数（大巴贴线除外）
+        if step < self.MIN_TRAVEL_FRAC * diag * 0.4 and area_ratio < self.HUGE_AREA_FRAC:
+            return None
+        # 横向几乎不动时方向不可靠，等下一帧
+        if abs(dx) < 0.004 * w and area_ratio < self.HUGE_AREA_FRAC:
             return None
 
         self._counted_cross.add(tid)
@@ -397,7 +412,7 @@ def draw_id_box(
 
 
 def draw_count_line(im, x1: int, y1: int, x2: int, y2: int, thickness: int = 3) -> None:
-    """绘制斜向计数线（黄线，位置对齐验收手绘红线）。"""
+    """绘制斜向计数线。"""
     p1 = (int(x1), int(y1))
     p2 = (int(x2), int(y2))
     # 夜景：先画黑边再画黄线，避免被霓虹/路面吞掉
@@ -430,7 +445,7 @@ def draw_osd_panel(
     latest_person: str = "",
     latest_vehicle: str = "",
 ) -> np.ndarray:
-    """左上半透明中文面板：当前人数/车数 + 过线累计 + 最新车/最新人（分开，避免车被假人覆盖）。"""
+    """左上半透明中文面板：当前人数/车数 + 过线累计 + 最新车/最新人。"""
     lines = [
         f"行人：{person_now}",
         f"车辆：{vehicle_now}",

@@ -1,4 +1,4 @@
-"""从正式测试视频抽帧到 mydata/images，供 LabelImg 标注（阶段 C）。"""
+"""从正式测试视频抽帧到 mydata/images，供 LabelImg 标注。"""
 from __future__ import annotations
 
 import argparse
