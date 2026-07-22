@@ -29,9 +29,8 @@ _FONT_CANDIDATES = [
 ]
 
 # 伦敦测试视频默认计数线（归一化坐标 0~1）
-# 右端：红绿灯后人行道人群侧 → 左端：镜头旁栏杆/立柱
-# 对应验收图手绘红线位置（略压右端、左端更靠底角）
-DEFAULT_LINE_NORM = (0.80, 0.52, 0.08, 0.92)
+# 左=近景灯柱底部；右=赌场外墙 LED 屏正下方人行道地面（对齐手绘红线）
+DEFAULT_LINE_NORM = (0.755, 0.64, 0.04, 0.92)
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -90,9 +89,15 @@ def _seg_intersect(p1, p2, q1, q2) -> bool:
 
 class LineCrossingCounter:
     """
-    斜向撞线计数（伦敦街景默认线：人行道红绿灯侧 → 镜头旁栏杆）。
-    轨迹中心穿越该线段时计数一次；方向按 x 增减判定为向右/向左。
+    斜向撞线计数（伦敦街景默认线：路缘侧 → 镜头旁灯柱底部）。
+    轨迹穿越该线段时计数一次；方向按穿越前后位移的 x 分量判定向左/向右。
+    需连续观察若干帧且位移足够，抑制灯柱假人、闪框误撞线。
     """
+
+    # 至少观察这么多帧才允许撞线计数（抑制新 ID 一出现就误计）
+    MIN_HITS = 3
+    # 穿越前后位移至少占画面对角线比例（隔帧时别太严）
+    MIN_TRAVEL_FRAC = 0.012
 
     def __init__(
         self,
@@ -130,10 +135,15 @@ class LineCrossingCounter:
         self.vehicle_up = 0
         self.vehicle_down = 0
         self.latest = ""
+        self.latest_person = ""
+        self.latest_vehicle = ""
         self._seen_ids: set = set()
         self._seen_person_ids: set = set()
         self._seen_vehicle_ids: set = set()
         self._prev_cxy: Dict[int, Tuple[float, float]] = {}
+        self._hist: Dict[int, List[Tuple[float, float]]] = {}
+        self._hits: Dict[int, int] = {}
+        self._first_side: Dict[int, float] = {}  # 首次相对黄线的侧符号
         self._track_cls: Dict[int, str] = {}
         self._counted_cross: set = set()  # track_id 撞线只计一次
         self._last_person_now = 0
@@ -193,11 +203,42 @@ class LineCrossingCounter:
         """若穿越计数线返回方向 'left'|'right'，否则 None。"""
         tid = int(track_id)
         x1, y1, x2, y2 = map(float, bbox_xyxy[:4])
+        bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
         kind = self._kind(class_name, cls_id=cls_id)
-        # 行人用脚点（底边中心），车辆用框中心，更贴近路面撞线
+        if kind == "other":
+            return None
+
+        w = int(frame_w) if frame_w and frame_w > 0 else max(1, int(x2 * 2))
+        h = int(frame_h)
+        diag = float((w * w + h * h) ** 0.5) or 1.0
+        area_ratio = (bw * bh) / max(float(w * h), 1.0)
+
+        # 抑制灯柱/细条假人：过瘦、过小、贴边碎框不计撞线
+        if kind == "person":
+            ar = bw / bh
+            if ar < 0.22 or bw < 0.012 * w or bh < 0.04 * h:
+                return None
+            if x1 < 0.02 * w and bw < 0.06 * w:
+                return None
+
+        # 行人/车辆都用底边中心（贴近路面）；大巴中心常悬在线上方导致永不穿越
         cx = (x1 + x2) * 0.5
-        cy = float(y2) if kind == "person" else (y1 + y2) * 0.5
+        cy = float(y2)
         self.observe_track(tid, class_name, cls_id=cls_id)
+
+        hits = self._hits.get(tid, 0) + 1
+        self._hits[tid] = hits
+        hist = self._hist.setdefault(tid, [])
+        hist.append((cx, cy))
+        if len(hist) > 10:
+            del hist[:-10]
+
+        ax, ay, bx, by = self.line_xyxy(w, h)
+        q0 = (float(ax), float(ay))
+        q1 = (float(bx), float(by))
+        side_now = _side(cx, cy, q0[0], q0[1], q1[0], q1[1])
+        if tid not in self._first_side and abs(side_now) > 1e-6:
+            self._first_side[tid] = 1.0 if side_now > 0 else -1.0
 
         prev = self._prev_cxy.get(tid)
         self._prev_cxy[tid] = (cx, cy)
@@ -205,71 +246,107 @@ class LineCrossingCounter:
             return None
         if tid in self._counted_cross:
             return None
+        if hits < self.MIN_HITS:
+            return None
 
-        w = int(frame_w) if frame_w and frame_w > 0 else max(1, int(x2 * 2))  # 兜底
-        h = int(frame_h)
-        ax, ay, bx, by = self.line_xyxy(w, h)
-        p0 = (prev[0], prev[1])
+        p0 = (float(prev[0]), float(prev[1]))
         p1 = (cx, cy)
-        q0 = (float(ax), float(ay))
-        q1 = (float(bx), float(by))
+        # 方向只用穿越当帧位移，避免 ID 抖动/长历史把「向左」判成「向右」
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        step = (dx * dx + dy * dy) ** 0.5
 
-        # 轨迹段与计数线相交，或两侧符号翻转且靠近线段
+        # 相对首帧侧翻：适合巴士一进画就压线、中心缓慢挪过线的情况
+        first = self._first_side.get(tid)
+        side_flip = (
+            first is not None
+            and abs(side_now) > 1e-6
+            and (side_now > 0) != (first > 0)
+        )
+
         crossed = _seg_intersect(p0, p1, q0, q1)
         if not crossed:
             s0 = _side(p0[0], p0[1], q0[0], q0[1], q1[0], q1[1])
-            s1 = _side(p1[0], p1[1], q0[0], q0[1], q1[0], q1[1])
-            if s0 == 0 or s1 == 0 or (s0 > 0) == (s1 > 0):
-                return None
-            # 交点大致在线段范围内（用中点近似）
-            mx, my = (p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5
-            # 到线段距离不要太远（隔帧时允许稍大）
+            s1 = side_now
+            if s0 != 0 and s1 != 0 and (s0 > 0) != (s1 > 0):
+                mx, my = (p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5
+                lx, ly = bx - ax, by - ay
+                llen2 = lx * lx + ly * ly + 1e-6
+                t = max(0.0, min(1.0, ((mx - ax) * lx + (my - ay) * ly) / llen2))
+                nx, ny = ax + t * lx, ay + t * ly
+                if (mx - nx) ** 2 + (my - ny) ** 2 <= (0.08 * max(w, h)) ** 2:
+                    crossed = True
+            # 大目标（大巴/近景大人）：侧翻 + 累计位移够即可
+            if not crossed and side_flip and area_ratio >= 0.05:
+                hx0, hy0 = hist[0]
+                travel = ((cx - hx0) ** 2 + (cy - hy0) ** 2) ** 0.5
+                if travel >= self.MIN_TRAVEL_FRAC * diag * 0.8:
+                    crossed = True
+                    dx = cx - hx0
+                    dy = cy - hy0
+
+        # 大巴/贴镜头近景人：一进画底边已压线，用「底边贴线 + 横向位移」计数
+        if not crossed and area_ratio >= 0.03:
+            hx0, hy0 = hist[0]
+            travel_x = abs(cx - hx0)
+            bottom_hits_line = _seg_intersect((x1, y2), (x2, y2), q0, q1)
             lx, ly = bx - ax, by - ay
             llen2 = lx * lx + ly * ly + 1e-6
-            t = max(0.0, min(1.0, ((mx - ax) * lx + (my - ay) * ly) / llen2))
+            t = max(0.0, min(1.0, ((cx - ax) * lx + (cy - ay) * ly) / llen2))
             nx, ny = ax + t * lx, ay + t * ly
-            if (mx - nx) ** 2 + (my - ny) ** 2 > (0.12 * max(w, h)) ** 2:
-                return None
-            crossed = True
+            near_line = (cx - nx) ** 2 + (cy - ny) ** 2 <= (0.10 * max(w, h)) ** 2
+            # 近景人框常盖住黄线整段：框与黄线有交集也算贴线
+            box_covers_line = (
+                min(x2, max(ax, bx)) >= max(x1, min(ax, bx))
+                and min(y2, max(ay, by)) >= max(y1, min(ay, by))
+            )
+            if (bottom_hits_line or near_line or (area_ratio >= 0.08 and box_covers_line)) and travel_x >= 0.035 * w:
+                crossed = True
+                dx = cx - hx0
+                dy = cy - hy0
+
         if not crossed:
+            return None
+        if step < self.MIN_TRAVEL_FRAC * diag * 0.35 and not side_flip and area_ratio < 0.03:
             return None
 
         self._counted_cross.add(tid)
-        # 以点的 x 变化判定左右（验收文案：向左/向右穿过黄线）
-        direction = "right" if cx >= prev[0] else "left"
+        direction = "right" if dx > 0 else "left"
         self.crossed += 1
         if direction == "right":
             self.right += 1
-            self.down = self.right  # 兼容旧字段
+            self.down = self.right
             dir_cn = "向右"
             if kind == "person":
                 self.person_right += 1
                 self.person_down = self.person_right
                 self.person_crossed += 1
-            elif kind == "vehicle":
+            else:
                 self.vehicle_right += 1
                 self.vehicle_down = self.vehicle_right
                 self.vehicle_crossed += 1
         else:
             self.left += 1
-            self.up = self.left  # 兼容旧字段
+            self.up = self.left
             dir_cn = "向左"
             if kind == "person":
                 self.person_left += 1
                 self.person_up = self.person_left
                 self.person_crossed += 1
-            elif kind == "vehicle":
+            else:
                 self.vehicle_left += 1
                 self.vehicle_up = self.vehicle_left
                 self.vehicle_crossed += 1
 
         if kind == "person":
             who = f"人{tid}号"
-        elif kind == "vehicle":
-            who = f"车{tid}号"
+            msg = f"最新人：{who}{dir_cn}穿过黄线"
+            self.latest_person = msg
         else:
-            who = f"{class_cn(class_name)}{tid}号"
-        self.latest = f"最新：{who}{dir_cn}穿过黄线"
+            who = f"车{tid}号"
+            msg = f"最新车：{who}{dir_cn}穿过黄线"
+            self.latest_vehicle = msg
+        self.latest = msg
         return direction
 
     def summary_text(self, person_now: int | None = None, vehicle_now: int | None = None) -> str:
@@ -282,9 +359,9 @@ class LineCrossingCounter:
             f"当前画面：行人 {person_now} / 车辆 {vehicle_now}",
             f"穿过黄线：人数 {self.person_crossed} / 车数 {self.vehicle_crossed}",
             f"方向：向左 {self.left} / 向右 {self.right}",
+            self.latest_vehicle or "最新车：暂无",
+            self.latest_person or "最新人：暂无",
         ]
-        if self.latest:
-            lines.append(self.latest)
         return "\n".join(lines)
 
 
@@ -350,23 +427,27 @@ def draw_osd_panel(
     person_crossed: int = 0,
     vehicle_crossed: int = 0,
     latest: str = "",
+    latest_person: str = "",
+    latest_vehicle: str = "",
 ) -> np.ndarray:
-    """左上半透明中文面板：当前人数/车数 + 过线累计 + 最新过线事件。"""
+    """左上半透明中文面板：当前人数/车数 + 过线累计 + 最新车/最新人（分开，避免车被假人覆盖）。"""
     lines = [
         f"行人：{person_now}",
         f"车辆：{vehicle_now}",
         f"穿过黄线人数：{person_crossed}",
         f"穿过黄线车数：{vehicle_crossed}",
+        latest_vehicle or "最新车：暂无",
+        latest_person or "最新人：暂无",
     ]
-    if latest:
-        lines.append(latest)
-    else:
-        lines.append("最新：暂无")
+    # 兼容旧单条 latest
+    if not latest_vehicle and not latest_person and latest:
+        lines[-2] = latest if "车" in latest else "最新车：暂无"
+        lines[-1] = latest if "人" in latest else "最新人：暂无"
 
-    font_size = max(22, int(im.shape[0] / 720 * 24))
+    font_size = max(20, int(im.shape[0] / 720 * 22))
     font = _load_font(font_size)
-    pad_x, pad_y = 14, 12
-    line_h = font_size + 16
+    pad_x, pad_y = 14, 10
+    line_h = font_size + 14
 
     def _text_width(text: str) -> int:
         try:
@@ -447,6 +528,8 @@ def render_frame(
         person_crossed=counter.person_crossed,
         vehicle_crossed=counter.vehicle_crossed,
         latest=counter.latest,
+        latest_person=getattr(counter, "latest_person", "") or "",
+        latest_vehicle=getattr(counter, "latest_vehicle", "") or "",
     )
     counter._last_person_now = person_now
     counter._last_vehicle_now = vehicle_now

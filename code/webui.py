@@ -127,14 +127,39 @@ def _filter_dets(boxes, scores, clss, min_side: float = 12.0, nms_iou: float = 0
                 if person_min_conf > 0 and float(scores[i]) < person_min_conf:
                     scores[i] = -1.0
                     continue
-                if ar >= 1.0 and area_ratio >= 0.04:
+                # 灯柱/栏杆假人：过瘦、贴左边
+                if ar <= 0.25 and bh > fh * 0.18:
+                    scores[i] = -1.0
+                    continue
+                if x1 < fw * 0.04 and ar <= 0.35 and bw < fw * 0.05:
+                    scores[i] = -1.0
+                    continue
+                # 近景贴镜头的大人：面积很大但竖长、贴画面底部 → 保持行人
+                near_cam_person = (
+                    area_ratio >= 0.05
+                    and ar <= 1.20
+                    and float(y2) >= fh * 0.80
+                    and bh >= fh * 0.30
+                )
+                if near_cam_person:
+                    pass
+                elif ar >= 1.15 and area_ratio >= 0.04:
                     clss[i] = 1
-                elif area_ratio >= 0.08:
+                elif area_ratio >= 0.10 and ar >= 1.0:
                     clss[i] = 1
                 elif ar <= 0.28 and bh > fh * 0.25:
                     scores[i] = -1.0
             elif int(clss[i]) == 1:
-                if ar <= 0.35 and bh > fh * 0.3:
+                # 误检成车的近景大人 → 改回行人
+                if (
+                    ar <= 1.20
+                    and area_ratio >= 0.05
+                    and float(y2) >= fh * 0.80
+                    and bh >= fh * 0.30
+                ):
+                    clss[i] = 0
+                # 双层巴士等高大目标可能 ar 偏小，勿误杀
+                elif ar <= 0.25 and bh > fh * 0.35 and area_ratio < 0.05:
                     scores[i] = -1.0
     else:
         for i in range(len(clss)):
@@ -161,8 +186,8 @@ def _filter_dets(boxes, scores, clss, min_side: float = 12.0, nms_iou: float = 0
         if not ok:
             continue
         idx = idx[ok]
-        # car 严去重；person 松（并排人群）
-        thr = 0.30 if int(c) == 1 else 0.55
+        # car 略松去重，减少并排/前后车被吃掉；person 更松
+        thr = 0.45 if int(c) == 1 else 0.55
         local = _nms_xyxy(boxes[idx].tolist(), scores[idx].tolist(), iou_thres=thr)
         keep_all.extend(idx[local].tolist())
     if not keep_all:
@@ -195,9 +220,9 @@ def _filter_dets(boxes, scores, clss, min_side: float = 12.0, nms_iou: float = 0
                 if iou < 0.55 and ios < 0.70:
                     continue
             elif same and ci == 1:
-                # 车：严去重
-                close = _center_close(bi, bj, rel=0.55)
-                if iou < 0.2 and ios < 0.35 and not close:
+                # 车：只压真正重叠的碎框；勿因中心略近就吃掉并排第二/三辆
+                close = _center_close(bi, bj, rel=0.28)
+                if iou < 0.35 and ios < 0.50 and not close:
                     continue
             else:
                 # 跨类：主要压「人框盖在车上」
@@ -251,8 +276,8 @@ def _dedup_tracks(tracks: np.ndarray, iou_thres: float = 0.3) -> np.ndarray:
                 suppressed = True
                 break
             if ci == 1 and cj == 1:
-                close = _center_close(bi, bj, rel=0.55)
-                if iou < iou_thres and ios < 0.35 and not close:
+                close = _center_close(bi, bj, rel=0.28)
+                if iou < max(iou_thres, 0.35) and ios < 0.50 and not close:
                     continue
                 suppressed = True
                 break
@@ -279,10 +304,10 @@ def _dedup_tracks(tracks: np.ndarray, iou_thres: float = 0.3) -> np.ndarray:
 class SimpleIoUTracker:
     """无 ReID 的轻量追踪（比 DeepSort 快一个数量级，适合 CPU / Gradio）。"""
 
-    def __init__(self, iou_thresh: float = 0.1, max_age: int = 60, dist_thresh: float = 0.35):
+    def __init__(self, iou_thresh: float = 0.08, max_age: int = 90, dist_thresh: float = 0.45):
         self.iou_thresh = iou_thresh
         self.max_age = max_age
-        self.dist_thresh = dist_thresh  # 中心点距离相对画面对角线（放宽，减少换号）
+        self.dist_thresh = dist_thresh  # 中心点距离相对画面对角线
         self.next_id = 1
         self.tracks = {}
 
@@ -299,24 +324,37 @@ class SimpleIoUTracker:
             diag = float((frame_wh[0] ** 2 + frame_wh[1] ** 2) ** 0.5) or 1.0
 
         for tid in list(self.tracks.keys()):
-            self.tracks[tid]["age"] += 1
+            tr = self.tracks[tid]
+            tr["age"] += 1
+            # 用速度预测下一帧位置，降低隔帧换号
+            vx, vy = tr.get("vx", 0.0), tr.get("vy", 0.0)
+            cx, cy = self._center(tr["box"])
+            tr["pred"] = (cx + vx, cy + vy)
 
         matched_det = set()
         matched_tid = set()
         pairs = []
         for di, box in enumerate(boxes):
             cx, cy = self._center(box)
+            bw = max(1.0, box[2] - box[0])
+            bh = max(1.0, box[3] - box[1])
+            # 大车允许更远关联
+            dist_lim = self.dist_thresh * (1.35 if clss[di] == 1 else 1.0)
+            iou_lim = self.iou_thresh * (0.7 if clss[di] == 1 else 1.0)
             for tid, tr in self.tracks.items():
                 if tr["cls"] != clss[di]:
                     continue
                 iou = _iou_xyxy(box, tr["box"])
-                tx, ty = self._center(tr["box"])
-                dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5 / diag
-                # IoU 优先；隔帧位移大时用中心距离兜底（阈值已放宽）
-                if iou >= self.iou_thresh:
-                    score = 1.0 + iou
-                elif dist <= self.dist_thresh:
-                    score = 1.0 - dist
+                px, py = tr.get("pred", self._center(tr["box"]))
+                dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5 / diag
+                # 尺寸接近加分，避免人/车框乱粘
+                tbw = max(1.0, tr["box"][2] - tr["box"][0])
+                tbh = max(1.0, tr["box"][3] - tr["box"][1])
+                size_ratio = min(bw * bh, tbw * tbh) / max(bw * bh, tbw * tbh)
+                if iou >= iou_lim:
+                    score = 2.0 + iou + 0.15 * size_ratio + 0.05 * min(tr.get("hits", 1), 20)
+                elif dist <= dist_lim and size_ratio >= 0.25:
+                    score = 1.0 - dist + 0.2 * size_ratio + 0.03 * min(tr.get("hits", 1), 20)
                 else:
                     score = -1.0
                 if score >= 0:
@@ -325,7 +363,32 @@ class SimpleIoUTracker:
         for score, di, tid in pairs:
             if di in matched_det or tid in matched_tid:
                 continue
-            self.tracks[tid] = {"box": boxes[di], "cls": clss[di], "age": 0}
+            old = self.tracks[tid]["box"]
+            new = boxes[di]
+            ocx, ocy = self._center(old)
+            ncx, ncy = self._center(new)
+            # 速度平滑
+            ovx, ovy = self.tracks[tid].get("vx", 0.0), self.tracks[tid].get("vy", 0.0)
+            vx = 0.6 * ovx + 0.4 * (ncx - ocx)
+            vy = 0.6 * ovy + 0.4 * (ncy - ocy)
+            hits = int(self.tracks[tid].get("hits", 0)) + 1
+            # 框轻微平滑，减轻抖动换号
+            a = 0.65
+            sm = [
+                a * new[0] + (1 - a) * old[0],
+                a * new[1] + (1 - a) * old[1],
+                a * new[2] + (1 - a) * old[2],
+                a * new[3] + (1 - a) * old[3],
+            ]
+            self.tracks[tid] = {
+                "box": sm,
+                "cls": clss[di],
+                "age": 0,
+                "vx": vx,
+                "vy": vy,
+                "hits": hits,
+                "pred": (ncx + vx, ncy + vy),
+            }
             matched_det.add(di)
             matched_tid.add(tid)
 
@@ -334,7 +397,15 @@ class SimpleIoUTracker:
                 continue
             tid = self.next_id
             self.next_id += 1
-            self.tracks[tid] = {"box": box, "cls": clss[di], "age": 0}
+            self.tracks[tid] = {
+                "box": box,
+                "cls": clss[di],
+                "age": 0,
+                "vx": 0.0,
+                "vy": 0.0,
+                "hits": 1,
+                "pred": self._center(box),
+            }
 
         for tid in [t for t, tr in self.tracks.items() if tr["age"] > self.max_age]:
             del self.tracks[tid]
@@ -381,8 +452,8 @@ def detect_fast(opt):
     device = select_device(opt.device)
     torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
 
-    frame_stride = max(1, int(getattr(opt, "frame_stride", 8)))
-    max_frames = int(getattr(opt, "max_frames", 40))
+    frame_stride = max(1, int(getattr(opt, "frame_stride", 2)))
+    max_frames = int(getattr(opt, "max_frames", 350))
     imgsz = int(getattr(opt, "imgsz", [320])[0] if isinstance(opt.imgsz, list) else getattr(opt, "imgsz", 320))
     imgsz = check_img_size(imgsz, s=32)
 
@@ -396,9 +467,9 @@ def detect_fast(opt):
     COUNTER.reset()
     # 放宽关联：隔帧后同一人不要反复开新 ID
     tracker = SimpleIoUTracker(
-        iou_thresh=0.08,
-        max_age=max(80, frame_stride * 8),
-        dist_thresh=0.4,
+        iou_thresh=0.05,
+        max_age=max(120, frame_stride * 12),
+        dist_thresh=0.50,
     )
 
     # 始终写到仓库 outputs/，不要用权重绝对路径当目录名
@@ -480,7 +551,7 @@ def detect_fast(opt):
             )
             if len(boxes):
                 tracks = tracker.update(boxes, clss, frame_wh=(out_w, out_h))
-                tracks = _dedup_tracks(tracks, iou_thres=0.28)
+                tracks = _dedup_tracks(tracks, iou_thres=0.35)
 
         rendered = render_frame(im_rs, tracks, names, COUNTER, colors, draw_line=True)
         writer.write(rendered)
@@ -949,7 +1020,7 @@ def build_demo(opt):
         opt.frame_stride = int(frame_stride)
         opt.max_frames = int(max_frames)
         opt.playback_fps = float(playback_fps)
-        opt.person_min_conf = 0.0
+        opt.person_min_conf = 0.15
         opt.imgsz = [640, 640] if use_deepsort else [416, 416]
 
         wlow = weight_path.replace("\\", "/").lower()
@@ -980,11 +1051,6 @@ def build_demo(opt):
             ), None
 
     with gr.Blocks(title="高速车流量计数器") as demo:
-        gr.Markdown(
-            "# 高速车流量计数器\n"
-            "处理后画面会叠加：**斜向黄线**（撞线计数线）+ 左上角 OSD"
-            "（当前行人/车辆、**穿过黄线人数/车数**、**最新：人/车ID号向左或向右穿过黄线**）。"
-        )
         with gr.Row():
             with gr.Column(scale=1):
                 video_in = gr.File(
@@ -999,10 +1065,10 @@ def build_demo(opt):
                     allow_custom_value=False,
                 )
                 classes = gr.Textbox(value="0,1", label="检测类别 ID（0=人，1=车）")
-                conf = gr.Slider(0.1, 0.9, value=0.2, step=0.05, label="置信度（人少→略降；车多框→略升）")
-                frame_stride = gr.Slider(1, 20, value=2, step=1, label="隔帧 stride（越大越快；计数不准就调小）")
-                max_frames = gr.Slider(0, 800, value=350, step=10, label="最多处理帧数（0=不限制；越大结果越长）")
-                playback_fps = gr.Slider(1, 15, value=2, step=1, label="输出播放帧率（越小越慢越长）")
+                conf = gr.Slider(0.1, 0.9, value=0.2, step=0.05, label="置信度")
+                frame_stride = gr.Slider(1, 20, value=2, step=1, label="隔帧 stride")
+                max_frames = gr.Slider(0, 800, value=350, step=10, label="最多处理帧数")
+                playback_fps = gr.Slider(1, 15, value=2, step=1, label="输出播放帧率")
                 use_deepsort = gr.Checkbox(value=False, label="使用 DeepSort")
                 btn = gr.Button("开始检测计数", variant="primary")
             with gr.Column(scale=2):
