@@ -1,4 +1,3 @@
-# 设置环境变量，限制线程数为1，python的并行并不是真正的并行，因为GIL锁
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -52,7 +51,7 @@ def detect(opt):  # gradio可视化时需要加一个参数
     COUNTER.reset()
 
     # Initialize
-    device = select_device(opt.device)   # 设备选择 cpu还是gpu
+    device = select_device(opt.device)
     half &= device.type != 'cpu'  # 半精度
 
     # The MOT16 evaluation runs multiple inference streams in parallel, each one writing to
@@ -68,7 +67,7 @@ def detect(opt):  # gradio可视化时需要加一个参数
         exp_name = yolo_model.split(".")[0]  # 导出目录yolo名称，下同
     elif type(yolo_model) is list and len(yolo_model) == 1:  # 单个yolo模型，以list方式送入
         exp_name = yolo_model[0].split(".")[0]
-    else:  # 多个yolo模型，在写论文时可以快速出对比结果
+    else:  # 多个yolo模型
         exp_name = "ensemble"
     exp_name = exp_name + "_" + deep_sort_model.split('/')[-1].split('.')[0]  # 导出目录yolo+deepsort名称，
     save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # 组装路径
@@ -80,13 +79,13 @@ def detect(opt):  # gradio可视化时需要加一个参数
     imgsz = check_img_size(imgsz, s=stride)  # 检查图片的输入尺寸
 
     # 半精度
-    half &= pt and device.type != 'cpu'  # 半精度只支持cuda，也就是GPU运行时
+    half &= pt and device.type != 'cpu'  # 半精度只支持GPU运行时
     if pt:
         model.model.half() if half else model.model.float()
 
     # 配置数据加载器
     vid_path, vid_writer = None, None
-    # 检查环境是否支持结果实时显示，也就是Matplotlib和opencv
+    # 检查环境是否支持结果实时显示，Matplotlib和opencv
     if show_vid:
         show_vid = check_imshow()
 
@@ -123,7 +122,7 @@ def detect(opt):  # gradio可视化时需要加一个参数
     names = model.module.names if hasattr(model, 'module') else model.names
 
     # 运行追踪器，model表示Yolo模型，deepsort_list里装的是deepsort模型
-    model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # 预热阶段，模型加载起来都要先预热，相当于快速推理，将模型加载到内存里，以便后续使用
+    model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # 预热阶段
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
     for frame_idx, (path, im, im0s, vid_cap, s) in enumerate(dataset):  #开始循环遍历数据集中的数据
         t1 = time_sync()
@@ -277,7 +276,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--yolo_model', nargs='+', type=str, default='../weights/yolov5n.pt', help='model.pt path(s)')
     parser.add_argument('--deep_sort_model', type=str, default='osnet_ibn_x1_0_MSMT17')
-    # 正式验收请改用 ../video/9663b86299d95875dcdbe231c1d5caba_raw.mp4（见 ../video/README.md）
     parser.add_argument('--source', type=str, default='../video/smoke_5s_720p.mp4', help='source; official test video under ../video/')
     parser.add_argument('--output', type=str, default='../outputs/inference/output', help='output folder')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
@@ -288,7 +286,6 @@ if __name__ == '__main__':
     parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
     parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
     parser.add_argument('--save-txt', action='store_true', help='save MOT compliant results to *.txt')
-    # class 0 is person, 1 is bycicle, 2 is car... 79 is oven
     parser.add_argument('--classes', nargs='+', type=int, default=[0, 2, 5, 7],
                         help='filter by class: person/car/bus/truck')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')

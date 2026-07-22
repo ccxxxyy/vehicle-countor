@@ -134,11 +134,9 @@ def _patch_create_shortcuts() -> None:
 
 
 def _prefer_london_file(win) -> None:
-    """优先打开待标注的新帧 london_030+（花车重训用）。"""
     files = sorted(IMAGES.glob("london_*.jpg"))
     if not files:
         return
-    # 优先未标注的新帧
     unlabeled = []
     for p in files:
         stem = p.stem
@@ -155,7 +153,7 @@ def _prefer_london_file(win) -> None:
         n_new = len([p for p in files if p.stem >= "london_030"])
         win.status(
             f"Opened {Path(target).name} | 待标新帧约 {len(unlabeled)}/{n_new} | "
-            f"花车务必选 car | W=画框 Ctrl+S=保存 D=下一张"
+            f"花车选car"
         )
     except Exception:
         traceback.print_exc()

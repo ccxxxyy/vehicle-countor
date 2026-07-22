@@ -1,4 +1,3 @@
-# 设置环境变量，限制线程数为1，python的并行并不是真正的并行，因为GIL锁
 import os
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -40,9 +39,9 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-COUNTER = LineCrossingCounter()  # 默认斜线：人行道红绿灯侧 → 镜头旁栏杆
+COUNTER = LineCrossingCounter()  # 默认斜线
 
-# 全局缓存：避免每次点「开始」都重新加载 YOLO（很慢）
+# 全局缓存：避免每次点「开始」都重新加载 YOLO
 _YOLO_CACHE = {}
 
 
@@ -127,7 +126,7 @@ def _filter_dets(boxes, scores, clss, min_side: float = 12.0, nms_iou: float = 0
                 if person_min_conf > 0 and float(scores[i]) < person_min_conf:
                     scores[i] = -1.0
                     continue
-                # 灯柱/栏杆假人：过瘦、贴左边
+                # 类人幻影
                 if ar <= 0.25 and bh > fh * 0.18:
                     scores[i] = -1.0
                     continue
@@ -186,8 +185,8 @@ def _filter_dets(boxes, scores, clss, min_side: float = 12.0, nms_iou: float = 0
         if not ok:
             continue
         idx = idx[ok]
-        # car 略松去重，减少并排/前后车被吃掉；person 更松
-        thr = 0.45 if int(c) == 1 else 0.55
+        # car 再松一点，减少并排/远景小车被 NMS 吃掉；person 更松
+        thr = 0.55 if int(c) == 1 else 0.55
         local = _nms_xyxy(boxes[idx].tolist(), scores[idx].tolist(), iou_thres=thr)
         keep_all.extend(idx[local].tolist())
     if not keep_all:
@@ -199,7 +198,7 @@ def _filter_dets(boxes, scores, clss, min_side: float = 12.0, nms_iou: float = 0
     keep_all = sorted(keep_all)
     boxes, scores, clss = boxes[keep_all], scores[keep_all], clss[keep_all]
 
-    # 2) 全局再压：车严；人只去掉几乎完全重叠的碎框（并排人群要保留）
+    # 2) 全局再压：车严；人只去掉几乎完全重叠的碎框（并排人群保留）
     order = sorted(range(len(boxes)), key=lambda i: float(scores[i]), reverse=True)
     keep: list[int] = []
     for i in order:
@@ -220,9 +219,9 @@ def _filter_dets(boxes, scores, clss, min_side: float = 12.0, nms_iou: float = 0
                 if iou < 0.55 and ios < 0.70:
                     continue
             elif same and ci == 1:
-                # 车：只压真正重叠的碎框；勿因中心略近就吃掉并排第二/三辆
-                close = _center_close(bi, bj, rel=0.28)
-                if iou < 0.35 and ios < 0.50 and not close:
+                # 车：更松，远景并排/前后车尽量保留
+                close = _center_close(bi, bj, rel=0.22)
+                if iou < 0.40 and ios < 0.55 and not close:
                     continue
             else:
                 # 跨类：主要压「人框盖在车上」
@@ -270,14 +269,14 @@ def _dedup_tracks(tracks: np.ndarray, iou_thres: float = 0.3) -> np.ndarray:
             iou = _iou_xyxy(bi, bj)
             ios = _inter_over_smaller(bi, bj)
             if ci == 0 and cj == 0:
-                # 人并排：不要因中心近就合并
+                # 人并排，不要因中心近就合并
                 if iou < 0.55 and ios < 0.70:
                     continue
                 suppressed = True
                 break
             if ci == 1 and cj == 1:
-                close = _center_close(bi, bj, rel=0.28)
-                if iou < max(iou_thres, 0.35) and ios < 0.50 and not close:
+                close = _center_close(bi, bj, rel=0.22)
+                if iou < max(iou_thres, 0.40) and ios < 0.55 and not close:
                     continue
                 suppressed = True
                 break
@@ -302,7 +301,7 @@ def _dedup_tracks(tracks: np.ndarray, iou_thres: float = 0.3) -> np.ndarray:
 
 
 class SimpleIoUTracker:
-    """无 ReID 的轻量追踪（比 DeepSort 快一个数量级，适合 CPU / Gradio）。"""
+    """无 ReID 的轻量追踪（比 DeepSort 快）。"""
 
     def __init__(self, iou_thresh: float = 0.08, max_age: int = 90, dist_thresh: float = 0.45):
         self.iou_thresh = iou_thresh
@@ -499,6 +498,10 @@ def detect_fast(opt):
         max(1.0, playback_fps),
         (out_w, out_h),
     )
+    if not writer.isOpened():
+        yield None, f"无法创建输出视频（VideoWriter 失败）：{out_path}", None
+        cap.release()
+        return
 
     processed = 0
     frame_idx = -1
@@ -546,7 +549,7 @@ def detect_fast(opt):
             custom = "phase_d" in str(weight).replace("\\", "/").lower()
             person_min = float(getattr(opt, "person_min_conf", 0.0) or 0.0)
             boxes, scores, clss = _filter_dets(
-                boxes, scores, clss, min_side=8.0, nms_iou=0.30,
+                boxes, scores, clss, min_side=6.0, nms_iou=0.40,
                 frame_wh=(out_w, out_h), custom_2cls=custom, person_min_conf=person_min,
             )
             if len(boxes):
@@ -569,12 +572,20 @@ def detect_fast(opt):
     cap.release()
     writer.release()
     elapsed = time.time() - t_all0
+    out_file = Path(out_path)
+    size_mb = (out_file.stat().st_size / (1024 * 1024)) if out_file.is_file() else 0.0
+    if not out_file.is_file() or size_mb < 0.01:
+        save_msg = f"写盘失败或文件为空：{out_path}"
+        download = None
+    else:
+        save_msg = f"视频已保存：{out_path}（{size_mb:.1f} MB）"
+        download = _to_gradio_file(out_path)
     done = (
         f"完成。耗时 {elapsed:.1f}s，共处理 {processed} 帧。\n"
         f"{COUNTER.summary_text(COUNTER._last_person_now, COUNTER._last_vehicle_now)}\n\n"
-        f"视频已保存：{out_path}"
+        f"{save_msg}"
     )
-    yield last_rgb, done, _to_gradio_file(out_path)
+    yield last_rgb, done, download
 
 
 def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
@@ -586,7 +597,6 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
     webcam = source == '0' or source.startswith(
         'rtsp') or source.startswith('http') or source.endswith('.txt')
 
-    # Gradio / 无头：绝不弹窗；并强制写出处理后视频
     preview_every = int(getattr(opt, 'preview_every', 5))
     frame_stride = max(1, int(getattr(opt, 'frame_stride', 1)))
     max_frames = int(getattr(opt, 'max_frames', 0))  # 0=不限制
@@ -596,24 +606,23 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
     if grstatus:
         show_vid = False
         save_vid = True
-        # 先立刻回传状态，避免界面一直转圈
         yield None, "正在加载模型与视频，请稍候…", None
 
     COUNTER.reset()
 
-    # Initialize（本项目固定 CPU）
+    # Initialize
     device = select_device(opt.device or "cpu")
     half &= device.type != 'cpu'  # CPU 下不会启用半精度
 
     # The MOT16 evaluation runs multiple inference streams in parallel, each one writing to
     # its own .txt file. Hence, in that case, the output folder is not restored
-    if not evaluate:  # 是否需要评估，在测试整个pipeline时可以使用
+    if not evaluate:
         if os.path.exists(out):  # 判断是否存在输出文件夹，有就删掉
             pass
             shutil.rmtree(out)  # 删掉输出文件夹
         os.makedirs(out)  # # 新建输出文件夹
 
-    # Directories（必须用 stem，不能用绝对路径字符串，否则f会写到 weights/ 下）
+    # Directories
     if type(yolo_model) is str:
         exp_name = Path(yolo_model).stem
     elif type(yolo_model) is list and len(yolo_model) == 1:
@@ -632,7 +641,7 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
     imgsz = check_img_size(imgsz, s=stride)  # 检查图片的输入尺寸
 
     # 半精度
-    half &= pt and device.type != 'cpu'  # 半精度只支持cuda，也就是GPU运行时
+    half &= pt and device.type != 'cpu'
     if pt:
         model.model.half() if half else model.model.float()
 
@@ -675,10 +684,10 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
     names = model.module.names if hasattr(model, 'module') else model.names
 
     # 运行追踪器，model表示Yolo模型，deepsort_list里装的是deepsort模型
-    model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # 预热阶段，模型加载起来都要先预热，相当于快速推理，将模型加载到内存里，以便后续使用
+    model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # 预热阶段
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
     for frame_idx, (path, im, im0s, vid_cap, s) in enumerate(dataset):  # 开始循环遍历数据集中的数据
-        # Gradio 加速：隔帧处理，并可限制最多处理帧数（否则 CPU 上像一直加载）
+        # Gradio 加速：隔帧处理，并可限制最多处理帧数
         if frame_idx % frame_stride != 0:
             continue
         if max_frames > 0 and processed >= max_frames:
@@ -838,7 +847,7 @@ def detect(opt, grstatus=False):  # gradio可视化时需要加一个参数
                     vid_path[i] = save_path
                     if isinstance(vid_writer[i], cv2.VideoWriter):
                         vid_writer[i].release()
-                    # 与叠加后的帧尺寸一致，避免黄线/OSD 写盘失败或花屏
+                    # 与叠加后的帧尺寸一致，避免黄线/OSD 写盘失败
                     h_out, w_out = im0.shape[:2]
                     if vid_cap:
                         fps = vid_cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -891,7 +900,7 @@ def _build_default_opt():
     parser.add_argument('--conf-thres', type=float, default=0.5, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
-    parser.add_argument('--device', default='cpu', help='本项目固定使用 CPU')
+    parser.add_argument('--device', default='cpu', help='固定使用 CPU')
     parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
     parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
     parser.add_argument('--save-txt', action='store_true', help='save MOT compliant results to *.txt')
@@ -1007,7 +1016,7 @@ def build_demo(opt):
         weight_path = label_to_path.get(str(weight), _resolve_weight(weight))
         opt.source = _as_video_path(video)
         opt.yolo_model = [weight_path]
-        opt.device = "cpu"  # 本项目固定 CPU
+        opt.device = "cpu"
         opt.classes = _parse_classes(classes_text)
         opt.conf_thres = float(conf_thres)
         opt.iou_thres = 0.45
@@ -1021,7 +1030,8 @@ def build_demo(opt):
         opt.max_frames = int(max_frames)
         opt.playback_fps = float(playback_fps)
         opt.person_min_conf = 0.15
-        opt.imgsz = [640, 640] if use_deepsort else [416, 416]
+        # 快速路径也用 512：416 夜景远车漏检偏多
+        opt.imgsz = [640, 640] if use_deepsort else [512, 512]
 
         wlow = weight_path.replace("\\", "/").lower()
         if "phase_d" in wlow or "london3" in wlow:
@@ -1051,6 +1061,7 @@ def build_demo(opt):
             ), None
 
     with gr.Blocks(title="高速车流量计数器") as demo:
+        gr.Markdown("# 高速车流量计数器")
         with gr.Row():
             with gr.Column(scale=1):
                 video_in = gr.File(
@@ -1065,8 +1076,8 @@ def build_demo(opt):
                     allow_custom_value=False,
                 )
                 classes = gr.Textbox(value="0,1", label="检测类别 ID（0=人，1=车）")
-                conf = gr.Slider(0.1, 0.9, value=0.2, step=0.05, label="置信度")
-                frame_stride = gr.Slider(1, 20, value=2, step=1, label="隔帧 stride")
+                conf = gr.Slider(0.1, 0.9, value=0.15, step=0.05, label="置信度")
+                frame_stride = gr.Slider(1, 20, value=1, step=1, label="隔帧 stride")
                 max_frames = gr.Slider(0, 800, value=350, step=10, label="最多处理帧数")
                 playback_fps = gr.Slider(1, 15, value=2, step=1, label="输出播放帧率")
                 use_deepsort = gr.Checkbox(value=False, label="使用 DeepSort")

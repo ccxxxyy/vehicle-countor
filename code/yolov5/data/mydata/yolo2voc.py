@@ -1,4 +1,4 @@
-"""把 LabelImg YOLO txt 转成 PascalVOC xml（阶段 C/D 兼容）。"""
+"""把 LabelImg YOLO txt 转成 PascalVOC xml。"""
 from __future__ import annotations
 
 import argparse
