@@ -2,10 +2,11 @@
 import xml.etree.ElementTree as ET
 import os
 from os import getcwd
+from pathlib import Path
 
 sets = ['train', 'val', 'test']
 classes = ["person", "car"]  # 与 LabelImg / predefined_classes.txt 一致
-abs_path = os.getcwd()
+abs_path = str(Path(__file__).resolve().parent)
 print(abs_path)
 
 
